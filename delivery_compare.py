@@ -11,7 +11,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-DEFAULT_DELAY_CODES = ('L', '7', '3', 'P')
+DEFAULT_DELAY_CODES = ('L', '7')
+DEFAULT_CANCEL_CODES = ('3', 'P')
 SCHEMA_VERSION = 2
 class CompareError(ValueError):
     pass
@@ -214,8 +215,11 @@ def aggregate(source):
             'op_dates': sorted({r.get('op_date', '') for r in rows if r.get('op_date')})}
     return result
 
-def build_comparison(initial, final, delay_codes=DEFAULT_DELAY_CODES):
+def build_comparison(initial, final, delay_codes=DEFAULT_DELAY_CODES, cancel_codes=DEFAULT_CANCEL_CODES):
     delays = {text(x).upper() for x in delay_codes}
+    cancels = {text(x).upper() for x in cancel_codes}
+    if delays & cancels:
+        raise CompareError('연기 코드와 취소 코드가 겹칩니다.')
     a, b = aggregate(initial), aggregate(final)
     rows = []
     for ident in sorted(set(a) | set(b)):
@@ -243,10 +247,12 @@ def build_comparison(initial, final, delay_codes=DEFAULT_DELAY_CODES):
             status = '상태 확인필요'
         elif all(x in delays for x in codes):
             status = '연기'
-        elif any(x in delays for x in codes):
-            status = '일부 연기(혼합)'
+        elif all(x in cancels for x in codes):
+            status = '취소'
+        elif any(x in delays or x in cancels for x in codes):
+            status = '상태 혼합 확인'
         else:
-            status = '연기코드 아님'
+            status = '일반상태'
         rows.append({'납품번호 / Delivery': ident, '매칭구분': matching,
             '최초 차량번호': ' / '.join(av), '최종 차량번호': ' / '.join(bv),
             '차량 이동': movement, '처리구분': status,
@@ -263,11 +269,12 @@ def build_comparison(initial, final, delay_codes=DEFAULT_DELAY_CODES):
     metrics = {'최초 납품번호': len(a), '최종 Delivery': len(b), '양쪽 일치': matched,
         '차량 변경': sum(r['차량 이동'] == '배차변경' for r in rows),
         '연기': sum(r['처리구분'] == '연기' for r in rows),
-        '일부 연기': sum(r['처리구분'] == '일부 연기(혼합)' for r in rows),
+        '취소': sum(r['처리구분'] == '취소' for r in rows),
+        '상태 혼합 확인': sum(r['처리구분'] == '상태 혼합 확인' for r in rows),
         '최종미존재': len(a) - matched, '최종만 존재': len(b) - matched,
         '확인필요': sum(bool(r['확인사항']) for r in rows),
         '최초 원본행': len(initial['rows']), '최종 원본행': len(final['rows'])}
-    return {'rows': rows, 'metrics': metrics, 'delay_codes': sorted(delays),
+    return {'rows': rows, 'metrics': metrics, 'delay_codes': sorted(delays), 'cancel_codes': sorted(cancels),
             'initial_sheet': initial['sheet'], 'final_sheet': final['sheet']}
 
 def transfer_summary(rows):
@@ -277,7 +284,8 @@ def transfer_summary(rows):
             c = groups[(r['최초 차량번호'], r['최종 차량번호'])]
             c['납품건수'] += 1
             c['연기'] += r['처리구분'] == '연기'
-            c['일부 연기'] += r['처리구분'] == '일부 연기(혼합)'
+            c['취소'] += r['처리구분'] == '취소'
+            c['상태 혼합 확인'] += r['처리구분'] == '상태 혼합 확인'
     return [{'최초 차량번호': a, '최종 차량번호': b, **dict(c)} for (a, b), c in sorted(groups.items(), key=lambda x: (-x[1]['납품건수'], x[0]))]
 
 def vehicle_summary(rows):
@@ -298,9 +306,11 @@ def vehicle_summary(rows):
             '등재 증감': len(last) - len(first), '동일대상 최초건수': len(paired_first), '동일대상 최종건수': len(paired_last),
             '반출': out, '반입': inc, '최초차량 기준 연기': sum(r['처리구분'] == '연기' for r in first),
             '최종차량 기준 연기': sum(r['처리구분'] == '연기' for r in last),
-            '최종차량 일부 연기': sum(r['처리구분'] == '일부 연기(혼합)' for r in last),
+            '최초차량 기준 취소': sum(r['처리구분'] == '취소' for r in first),
+            '최종차량 기준 취소': sum(r['처리구분'] == '취소' for r in last),
+            '최종차량 상태혼합': sum(r['처리구분'] == '상태 혼합 확인' for r in last),
             '최종미존재': missing, '최종만 존재': extra, '등재건수 검산차이': len(last) - expected,
-            '연기코드 아닌 최종건수': sum(r['처리구분'] == '연기코드 아님' for r in last)})
+            '일반상태 최종건수': sum(r['처리구분'] == '일반상태' for r in last)})
     return result
 
 def csv_bytes(rows):
