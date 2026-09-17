@@ -15,48 +15,94 @@ from pair_storage import PairStore
 DELAY_CODES = ('L', '7')
 CANCEL_CODES = ('3', 'P')
 
-def _decode_csv(data: bytes) -> str:
+def _decode_candidates(data: bytes):
+    """Excel/사내 시스템에서 자주 나오는 한국어 CSV 문자셋을 안전하게 순서대로 시도합니다."""
     if len(data) > 30_000_000:
         raise CompareError('파일 크기는 30MB 이하여야 합니다.')
-    for enc in ('utf-8-sig', 'cp949', 'euc-kr'):
+    if data.startswith(b'PK\\x03\\x04'):
+        raise CompareError('이 파일은 CSV가 아니라 XLSX 형식입니다. Excel에서 CSV 또는 CSV UTF-8로 다시 저장해 주세요.')
+    if data.startswith(b'\\xD0\\xCF\\x11\\xE0'):
+        raise CompareError('이 파일은 CSV가 아니라 구형 Excel 형식입니다. Excel에서 CSV 또는 CSV UTF-8로 다시 저장해 주세요.')
+    encodings = ('utf-8-sig', 'cp949', 'euc-kr', 'utf-16', 'utf-16-le', 'utf-16-be')
+    seen = set()
+    for enc in encodings:
         try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    raise CompareError('CSV 문자 인코딩을 읽을 수 없습니다. Excel에서 CSV UTF-8 형식으로 다시 저장해 주세요.')
+            content = data.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        # 잘못된 UTF-16 추측으로 NUL이 과다하게 생기는 경우 제외
+        nul_ratio = content.count('\\x00') / max(1, len(content))
+        if nul_ratio > 0.05:
+            continue
+        key = content[:5000]
+        if key in seen:
+            continue
+        seen.add(key)
+        yield enc, content.replace('\\x00', '')
 
-def _csv_delimiter(content: str) -> str:
-    sample = content[:50000]
+
+def _rows_with_delimiter(content: str, delimiter: str):
     try:
-        return csv.Sniffer().sniff(sample, delimiters=',\t;').delimiter
+        return list(csv.reader(io.StringIO(content, newline=''), delimiter=delimiter))
     except csv.Error:
-        first = sample.splitlines()[0] if sample.splitlines() else ''
-        return '\t' if first.count('\t') > first.count(',') else ','
+        return []
 
-def read_csv_source(data: bytes, kind: str, filename: str = ''):
-    """Excel에서 저장한 CSV를 읽고 비교에 필요한 열만 메모리에 남깁니다."""
-    if kind not in ('initial', 'final'):
-        raise CompareError('파일 구분 오류')
-    content = _decode_csv(data)
-    if '\x00' in content:
-        raise CompareError('CSV 파일 형식이 아닙니다. Excel에서 CSV UTF-8로 다시 저장해 주세요.')
-    delimiter = _csv_delimiter(content)
-    rows = list(csv.reader(io.StringIO(content, newline=''), delimiter=delimiter))
-    required = {'납품번호', '차량번호'} if kind == 'initial' else {'Delivery', 'Vehicle Number(Full)', 'PDAStepStatus'}
-    header_i = None
-    headers = None
-    for i, row in enumerate(rows[:25]):
-        cleaned = [text(v).replace('\ufeff', '').strip() for v in row]
+
+def _find_header(rows, required):
+    for i, row in enumerate(rows[:40]):
+        cleaned = [text(v).replace('\\ufeff', '').strip() for v in row]
         if required.issubset(set(cleaned)):
-            header_i = i
             headers = {}
             for col, name in enumerate(cleaned):
                 if name and name not in headers:
-                    headers[name] = col  # 같은 헤더가 두 번이면 첫 번째 열 사용
-            break
-    if header_i is None or headers is None:
-        raise CompareError('필수 열을 찾지 못했습니다. 필요한 열: ' + ', '.join(sorted(required)))
+                    headers[name] = col
+            return i, headers
+    return None, None
 
+
+def read_csv_source(data: bytes, kind: str, filename: str = ''):
+    """CSV/Excel Unicode 텍스트를 읽고 비교에 필요한 열만 메모리에 남깁니다."""
+    if kind not in ('initial', 'final'):
+        raise CompareError('파일 구분 오류')
+    required = {'납품번호', '차량번호'} if kind == 'initial' else {'Delivery', 'Vehicle Number(Full)', 'PDAStepStatus'}
+
+    decoded_any = False
+    best_columns = []
+    chosen = None
+    # 문자셋 + 구분자(쉼표/탭/세미콜론)를 모두 자동 시도합니다.
+    for enc, content in _decode_candidates(data):
+        decoded_any = True
+        delimiters = []
+        try:
+            sniffed = csv.Sniffer().sniff(content[:50000], delimiters=',\\t;').delimiter
+            delimiters.append(sniffed)
+        except csv.Error:
+            pass
+        for d in (',', '\\t', ';'):
+            if d not in delimiters:
+                delimiters.append(d)
+        for delimiter in delimiters:
+            rows = _rows_with_delimiter(content, delimiter)
+            if not rows:
+                continue
+            header_i, headers = _find_header(rows, required)
+            if headers is not None:
+                chosen = (enc, delimiter, rows, header_i, headers)
+                break
+            # 오류 안내용으로 첫 행 열 이름 일부만 보관(민감 데이터 행은 사용하지 않음)
+            if rows:
+                first = [text(v).replace('\\ufeff', '').strip() for v in rows[0]][:20]
+                if len(first) > len(best_columns):
+                    best_columns = first
+        if chosen:
+            break
+
+    if not decoded_any:
+        raise CompareError('CSV 문자 인코딩을 읽지 못했습니다. UTF-8/CP949/EUC-KR/UTF-16을 모두 확인했습니다. 파일이 암호화되었거나 CSV가 아닌 경우가 있으니 Excel에서 새 CSV로 저장해 주세요.')
+    if chosen is None:
+        raise CompareError('파일은 읽었지만 필수 열을 찾지 못했습니다. 필요한 열: ' + ', '.join(sorted(required)) + '. CSV 첫 행에 열 제목이 있는지 확인해 주세요.')
+
+    enc, delimiter, rows, header_i, headers = chosen
     output = []
     blank_rows = []
     def cell(row, name):
@@ -70,7 +116,10 @@ def read_csv_source(data: bytes, kind: str, filename: str = ''):
         if not delivery:
             blank_rows.append(physical_row)
             continue
-        if not re.fullmatch(r'\d+', delivery):
+        # Excel이 큰 숫자를 1.234E+09처럼 바꾸는 것을 막기 위해 납품번호는 문자열 숫자로 유지합니다.
+        if delivery.endswith('.0') and delivery[:-2].isdigit():
+            delivery = delivery[:-2]
+        if not re.fullmatch(r'\\d+', delivery):
             raise CompareError(f'{physical_row}행 납품번호가 숫자 식별자가 아닙니다: {delivery[:30]}')
         rec = {'id': delivery, 'row': physical_row}
         if kind == 'initial':
@@ -102,7 +151,7 @@ def read_csv_source(data: bytes, kind: str, filename: str = ''):
         raise CompareError(f'납품번호가 비어 있는 {len(blank_rows)}행이 있습니다. 예: {blank_rows[:5]}. 원본을 확인하세요.')
     if not output:
         raise CompareError('자료 행이 없습니다.')
-    return {'kind': kind, 'sheet': filename or 'CSV', 'rows': output}
+    return {'kind': kind, 'sheet': filename or 'CSV', 'rows': output, 'encoding': enc}
 
 def build_comparison_local(initial, final):
     """기존 delivery_compare.py 버전과 무관하게 현재 업무 기준으로 판정합니다."""
@@ -243,7 +292,7 @@ def render(mode, can_edit, actor, store):
         if preview and preview.get('selected') == selected:
             work = preview
         with st.expander('① CSV 파일 등록 · 상세정보.csv + 최종리스트.csv', expanded=work is None):
-            st.info('Excel에서 CSV UTF-8로 저장한 두 파일을 올리세요. 필요한 납품번호·차량·품목·상태 열만 읽고 고객명·주소·전화번호는 저장하지 않습니다.')
+            st.info('Excel에서 CSV 또는 CSV UTF-8로 저장한 두 파일을 올리세요. UTF-8·CP949·EUC-KR·UTF-16을 자동 인식합니다. 필요한 납품번호·차량·품목·상태 열만 읽고 고객명·주소·전화번호는 저장하지 않습니다.')
             if not can_edit:
                 st.caption('조회 전용 계정입니다. 편집 권한이 있는 담당자가 파일을 등록해야 합니다.')
             else:
