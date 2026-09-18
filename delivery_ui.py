@@ -346,11 +346,15 @@ def vehicle_summary_local(rows):
         # 이 검산은 원본 최종 등재건수 기준입니다. 연기·취소 제외 최종 배차건수와는 별도입니다.
         expected_listed = len(first) - missing - out + inc + extra
 
+        dispatch_change = out + inc
+        issue_total = dispatch_change + delay_last + cancel_last
         result.append({
             '차량번호': v,
             '최초 배차건수': len(first),
             '최종 배차건수': final_dispatch,
             '배차 증감': final_dispatch - len(first),
+            '배차변경': dispatch_change,
+            '변동합계': issue_total,
             '최종 원본등재(참고)': final_listed,
             '연기 제외': delay_last,
             '취소 제외': cancel_last,
@@ -668,54 +672,192 @@ def render(mode, can_edit, actor, store):
         if not work:
             st.info('먼저 저장된 날짜를 선택하거나 새 자료를 등록하세요.')
         else:
-            vehicle_rows = vehicle_summary_local(all_rows)
-            st.subheader('차량별 최초 ↔ 최종 배차건수')
+            vehicle_rows_all = vehicle_summary_local(all_rows)
+            st.subheader('차량별 배차 변동 한눈에 보기')
+            st.caption('배차변경 = 해당 차량의 반출 + 반입 건수입니다. 연기·취소는 최종 차량 기준으로 집계합니다.')
 
-            vsearch = st.text_input(
+            # ── 차량 하나를 선택하면 핵심 수치를 큰 카드로 표시
+            vehicle_names = [r['차량번호'] for r in vehicle_rows_all]
+            selected_vehicle = st.selectbox(
+                '차량 선택',
+                vehicle_names,
+                key='vehicle_focus_select'
+            )
+            focus = next((r for r in vehicle_rows_all if r['차량번호'] == selected_vehicle), None)
+
+            if focus:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric('최초 배차', f"{focus['최초 배차건수']:,} 건")
+                c2.metric(
+                    '최종 배차',
+                    f"{focus['최종 배차건수']:,} 건",
+                    f"{focus['배차 증감']:+,} 건",
+                    delta_color='off'
+                )
+                c3.metric(
+                    '배차변경',
+                    f"{focus['배차변경']:,} 건",
+                    f"반출 {focus['반출']:,} · 반입 {focus['반입']:,}",
+                    delta_color='off'
+                )
+                c4.metric('연기', f"{focus['연기 제외']:,} 건")
+                c5.metric('취소', f"{focus['취소 제외']:,} 건")
+
+                # 선택 차량의 실제 변동 납품번호를 바로 확인
+                focus_events = []
+                for r in all_rows:
+                    initial_hit = selected_vehicle in r['최초 차량번호'].split(' / ')
+                    final_hit = selected_vehicle in r['최종 차량번호'].split(' / ')
+                    is_change = r['차량 이동'] == '배차변경' and (initial_hit or final_hit)
+                    is_delay = r['처리구분'] == '연기' and final_hit
+                    is_cancel = r['처리구분'] == '취소' and final_hit
+                    if not (is_change or is_delay or is_cancel):
+                        continue
+
+                    kinds = []
+                    if is_change:
+                        if initial_hit:
+                            kinds.append('배차변경 반출')
+                        if final_hit:
+                            kinds.append('배차변경 반입')
+                    if is_delay:
+                        kinds.append('연기')
+                    if is_cancel:
+                        kinds.append('취소')
+
+                    focus_events.append({
+                        '납품번호': r['납품번호 / Delivery'],
+                        '구분': ' / '.join(kinds),
+                        '최초 차량': r['최초 차량번호'],
+                        '최종 차량': r['최종 차량번호'],
+                        'PDA': r['PDAStepStatus'] or '(빈값)',
+                    })
+
+                with st.expander(f'{selected_vehicle} 변동 상세 · {len(focus_events):,}건'):
+                    if focus_events:
+                        st.dataframe(
+                            focus_events,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=min(420, 42 + len(focus_events) * 35)
+                        )
+                    else:
+                        st.info('이 차량에는 배차변경·연기·취소가 없습니다.')
+
+            st.divider()
+
+            # ── 전체 차량 비교: 변동이 있는 차량을 한 차트에 표시
+            h1, h2 = st.columns([1.2, 1])
+            vsearch = h1.text_input(
                 '차량번호 검색',
                 placeholder='예: 경북80아9992',
-                key='vehicle_simple_search'
+                key='vehicle_issue_search'
             ).strip()
-            if vsearch:
-                vehicle_rows = [r for r in vehicle_rows if vsearch.lower() in r['차량번호'].lower()]
+            issue_only = h2.toggle(
+                '변동 있는 차량만',
+                value=True,
+                key='vehicle_issue_only'
+            )
 
-            chart_rows = sorted(vehicle_rows, key=lambda x: abs(x['배차 증감']), reverse=True)[:20]
-            if chart_rows:
-                points = [
-                    {'차량번호': r['차량번호'], '시점': stage, '배차건수': r[key]}
-                    for r in chart_rows
-                    for stage, key in [('최초', '최초 배차건수'), ('최종', '최종 배차건수')]
+            vehicle_rows = vehicle_rows_all
+            if vsearch:
+                vehicle_rows = [
+                    r for r in vehicle_rows
+                    if vsearch.lower() in r['차량번호'].lower()
                 ]
+            if issue_only:
+                vehicle_rows = [r for r in vehicle_rows if r['변동합계'] > 0]
+
+            # 변동합계가 큰 차량부터 보여줌
+            vehicle_rows = sorted(
+                vehicle_rows,
+                key=lambda r: (-r['변동합계'], -r['배차변경'], r['차량번호'])
+            )
+
+            chart_rows = vehicle_rows[:25]
+            if chart_rows:
+                points = []
+                for r in chart_rows:
+                    points.extend([
+                        {'차량번호': r['차량번호'], '구분': '배차변경', '건수': r['배차변경']},
+                        {'차량번호': r['차량번호'], '구분': '연기', '건수': r['연기 제외']},
+                        {'차량번호': r['차량번호'], '구분': '취소', '건수': r['취소 제외']},
+                    ])
+
+                st.markdown('**차량별 배차변경 · 연기 · 취소**')
                 st.vega_lite_chart(
                     spec={
                         'data': {'values': points},
                         'mark': {'type': 'bar', 'cornerRadiusEnd': 3},
                         'encoding': {
-                            'x': {'field': '차량번호', 'type': 'nominal', 'axis': {'labelAngle': -40}},
-                            'xOffset': {'field': '시점'},
-                            'y': {'field': '배차건수', 'type': 'quantitative'},
-                            'color': {'field': '시점', 'type': 'nominal'},
+                            'x': {
+                                'field': '차량번호',
+                                'type': 'nominal',
+                                'sort': [r['차량번호'] for r in chart_rows],
+                                'axis': {'labelAngle': -40, 'title': None}
+                            },
+                            'xOffset': {'field': '구분'},
+                            'y': {
+                                'field': '건수',
+                                'type': 'quantitative',
+                                'axis': {'title': '건수'},
+                                'scale': {'domainMin': 0}
+                            },
+                            'color': {
+                                'field': '구분',
+                                'type': 'nominal',
+                                'legend': {'orient': 'top', 'title': None}
+                            },
                             'tooltip': [
-                                {'field': '차량번호'},
-                                {'field': '시점'},
-                                {'field': '배차건수'}
+                                {'field': '차량번호', 'type': 'nominal'},
+                                {'field': '구분', 'type': 'nominal'},
+                                {'field': '건수', 'type': 'quantitative'}
                             ]
                         }
                     },
                     use_container_width=True
                 )
+                st.caption('변동합계가 많은 차량 순으로 최대 25대를 표시합니다.')
+            else:
+                st.info('조건에 맞는 차량 변동내역이 없습니다.')
 
+            # ── 표도 핵심 정보만
             compact_vehicle = [{
                 '차량번호': r['차량번호'],
-                '최초 배차': r['최초 배차건수'],
-                '최종 배차': r['최종 배차건수'],
-                '증감': r['배차 증감'],
+                '배차변경': r['배차변경'],
                 '반출': r['반출'],
                 '반입': r['반입'],
                 '연기': r['연기 제외'],
                 '취소': r['취소 제외'],
+                '변동합계': r['변동합계'],
+                '최초 배차': r['최초 배차건수'],
+                '최종 배차': r['최종 배차건수'],
+                '배차 증감': r['배차 증감'],
             } for r in vehicle_rows]
-            show_table(compact_vehicle, '차량별_배차현황', 500)
+
+            st.markdown(f'**차량별 요약 · {len(compact_vehicle):,}대**')
+            if compact_vehicle:
+                st.dataframe(
+                    compact_vehicle,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=520,
+                    column_config={
+                        '배차변경': st.column_config.NumberColumn(help='반출 + 반입'),
+                        '연기': st.column_config.NumberColumn(help='최종 차량 기준 L·7'),
+                        '취소': st.column_config.NumberColumn(help='최종 차량 기준 3·P'),
+                        '변동합계': st.column_config.NumberColumn(help='배차변경 + 연기 + 취소'),
+                    }
+                )
+                st.download_button(
+                    '차량별 요약 CSV 내려받기',
+                    csv_bytes(compact_vehicle),
+                    file_name=f'차량별_배차변동_{visible_day or "조회"}.csv',
+                    mime='text/csv',
+                    key='vehicle_issue_download'
+                )
+            else:
+                st.info('표시할 차량이 없습니다.')
 
     # ─────────────────────────────────────────────────────────────
     # 4. 자료등록
