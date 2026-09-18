@@ -375,6 +375,20 @@ def vehicle_summary_local(rows):
     return result
 
 
+
+def vehicle_matches_query(vehicle_no: str, query: str) -> bool:
+    """차량번호 전체/일부 또는 마지막 숫자 4자리로 조회합니다."""
+    q = re.sub(r'\s+', '', text(query)).lower()
+    v = re.sub(r'\s+', '', text(vehicle_no)).lower()
+    if not q:
+        return True
+    if q in v:
+        return True
+    q_digits = re.sub(r'\D', '', q)
+    v_digits = re.sub(r'\D', '', v)
+    return len(q_digits) == 4 and v_digits.endswith(q_digits)
+
+
 def show_table(rows, key, height=420):
     if not rows:
         st.info('조회 조건에 해당하는 내역이 없습니다.')
@@ -388,7 +402,11 @@ def render(mode, can_edit, actor, store):
     # ─────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
-    .block-container {max-width: 1500px; padding-top: 1.4rem; padding-bottom: 3rem;}
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.15rem;
+        padding-bottom: 3rem;
+    }
     h1, h2, h3 {letter-spacing: -0.035em;}
     [data-testid="stMetric"] {
         background: #ffffff;
@@ -399,17 +417,28 @@ def render(mode, can_edit, actor, store):
     }
     [data-testid="stMetricLabel"] {font-weight: 700;}
     [data-testid="stMetricValue"] {font-size: 1.9rem;}
-    div[data-testid="stTabs"] button {font-weight: 700;}
+    div[data-testid="stTabs"] button {
+        font-weight: 700;
+        white-space: nowrap;
+    }
     .dispatch-head {
         border: 1px solid #e9edf2;
         background: #ffffff;
         border-radius: 18px;
-        padding: 20px 22px;
-        margin-bottom: 16px;
+        padding: 18px 22px;
+        margin-bottom: 14px;
         box-shadow: 0 2px 10px rgba(20,35,55,.04);
     }
-    .dispatch-head .title {font-size: 1.45rem; font-weight: 800; letter-spacing: -.04em;}
-    .dispatch-head .sub {font-size: .88rem; color: #6b7280; margin-top: 5px;}
+    .dispatch-head .title {
+        font-size: 1.42rem;
+        font-weight: 800;
+        letter-spacing: -.04em;
+    }
+    .dispatch-head .sub {
+        font-size: .88rem;
+        color: #6b7280;
+        margin-top: 5px;
+    }
     .soft-note {
         background: #f8fafc;
         border: 1px solid #edf1f5;
@@ -417,6 +446,59 @@ def render(mode, can_edit, actor, store):
         padding: 12px 14px;
         color: #667085;
         font-size: .86rem;
+    }
+
+    /* 휴대폰 화면 */
+    @media (max-width: 768px) {
+        .block-container {
+            max-width: 100%;
+            padding: .65rem .65rem 2rem .65rem;
+        }
+        .dispatch-head {
+            padding: 13px 14px;
+            border-radius: 13px;
+            margin-bottom: 10px;
+        }
+        .dispatch-head .title {font-size: 1.15rem;}
+        .dispatch-head .sub {
+            font-size: .76rem;
+            line-height: 1.45;
+        }
+        [data-testid="stMetric"] {
+            padding: 10px 10px 8px 10px;
+            border-radius: 12px;
+            min-height: 88px;
+        }
+        [data-testid="stMetricLabel"] {font-size: .78rem;}
+        [data-testid="stMetricValue"] {font-size: 1.35rem;}
+        div[data-testid="stHorizontalBlock"] {
+            gap: .42rem;
+            flex-wrap: wrap;
+        }
+        div[data-testid="column"] {
+            min-width: calc(50% - .3rem) !important;
+            flex: 1 1 calc(50% - .3rem) !important;
+        }
+        div[data-testid="stTabs"] [role="tablist"] {
+            gap: .1rem;
+            overflow-x: auto;
+        }
+        div[data-testid="stTabs"] button {
+            font-size: .76rem;
+            padding-left: .55rem;
+            padding-right: .55rem;
+        }
+        div[data-testid="stDataFrame"] {
+            font-size: .8rem;
+        }
+        .stButton > button,
+        .stFormSubmitButton > button {
+            min-height: 44px;
+            font-weight: 800;
+        }
+        input {
+            min-height: 44px;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -436,19 +518,29 @@ def render(mode, can_edit, actor, store):
     if store:
         try:
             repository = PairStore(store)
-            saved_days = repository.list_ids()
+            saved_days = sorted(repository.list_ids(), reverse=True)
         except Exception:
             st.error('저장된 배차자료를 읽을 수 없습니다. 데이터베이스 연결을 확인하세요.')
             return
 
-    # 상단의 날짜 선택만 남기고 사이드바의 복잡한 필터는 제거
+    # 공유 사용자는 최신 저장일을 바로 보며, 관리자는 새 자료 등록도 선택할 수 있습니다.
     top1, top2 = st.columns([1.15, 1.85])
-    options = [NEW_LABEL] + saved_days
+    if can_edit:
+        options = [NEW_LABEL] + saved_days
+        help_text = '과거 자료를 보려면 날짜를 선택하고, 새 자료를 넣으려면 새 배차 등록을 선택하세요.'
+    else:
+        options = saved_days
+        help_text = '조회할 배차일을 선택하세요. 최신 저장일이 먼저 표시됩니다.'
+
+    if not options:
+        st.info('아직 저장된 배차자료가 없습니다.')
+        return
+
     selected = top1.selectbox(
         '배차일 선택',
         options,
         key='pair_day_simple',
-        help='과거 자료를 보려면 날짜를 선택하고, 새 자료를 넣으려면 새 배차 등록을 선택하세요.'
+        help=help_text
     )
 
     if selected != NEW_LABEL and repository:
@@ -478,10 +570,16 @@ def render(mode, can_edit, actor, store):
             st.error('선택한 배차일의 자료를 불러오지 못했습니다.')
             return
     else:
-        top2.markdown(
-            '<div class="soft-note" style="margin-top:29px">새 배차자료는 아래 <b>자료등록</b> 탭에서 붙여넣으면 됩니다.</div>',
-            unsafe_allow_html=True
-        )
+        if can_edit:
+            top2.markdown(
+                '<div class="soft-note" style="margin-top:29px">새 배차자료는 아래 <b>자료등록</b> 탭에서 붙여넣으면 됩니다.</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            top2.markdown(
+                '<div class="soft-note" style="margin-top:29px">조회 전용 화면 · 자료 수정 및 등록 기능은 표시되지 않습니다.</div>',
+                unsafe_allow_html=True
+            )
 
     if mode == 'demo':
         initial, final = demo_pair()
@@ -511,12 +609,21 @@ def render(mode, can_edit, actor, store):
             days = sorted({r.get('배차일', '') for r in all_rows if r.get('배차일')})
             visible_day = days[0] if len(days) == 1 else ''
 
-    tab_dash, tab_delivery, tab_vehicle, tab_input = st.tabs([
-        '📊 한눈에 보기',
-        '🔎 납품번호 조회',
-        '🚛 차량별 현황',
-        '➕ 자료등록'
-    ])
+    if can_edit:
+        tab_dash, tab_delivery, tab_vehicle, tab_input = st.tabs([
+            '📊 한눈에 보기',
+            '🔎 납품번호 조회',
+            '🚛 차량별 현황',
+            '➕ 자료등록'
+        ])
+    else:
+        # 공유용 화면은 차량별 현황이 첫 화면이며 자료등록은 숨깁니다.
+        tab_vehicle, tab_delivery, tab_dash = st.tabs([
+            '🚛 차량별 현황',
+            '🔎 납품번호 조회',
+            '📊 전체 요약'
+        ])
+        tab_input = None
 
     # ─────────────────────────────────────────────────────────────
     # 1. 한눈에 보기
@@ -676,14 +783,47 @@ def render(mode, can_edit, actor, store):
             st.subheader('차량별 배차 변동 한눈에 보기')
             st.caption('배차변경 = 해당 차량의 반출 + 반입 건수입니다. 연기·취소는 최종 차량 기준으로 집계합니다.')
 
-            # ── 차량 하나를 선택하면 핵심 수치를 큰 카드로 표시
+            # ── 차량번호 전체 또는 뒤 4자리 검색 + 조회 버튼
             vehicle_names = [r['차량번호'] for r in vehicle_rows_all]
-            selected_vehicle = st.selectbox(
-                '차량 선택',
-                vehicle_names,
-                key='vehicle_focus_select'
-            )
-            focus = next((r for r in vehicle_rows_all if r['차량번호'] == selected_vehicle), None)
+
+            with st.form('vehicle_lookup_form', clear_on_submit=False):
+                s1, s2 = st.columns([3, 1])
+                search_input = s1.text_input(
+                    '차량번호 조회',
+                    placeholder='전체 차량번호 또는 뒤 4자리 (예: 9992)',
+                    key='vehicle_lookup_input'
+                )
+                search_clicked = s2.form_submit_button(
+                    '조회',
+                    type='primary',
+                    use_container_width=True
+                )
+
+            if search_clicked:
+                st.session_state['vehicle_lookup_applied'] = search_input.strip()
+
+            applied_query = st.session_state.get('vehicle_lookup_applied', '')
+            matched_names = [
+                v for v in vehicle_names
+                if vehicle_matches_query(v, applied_query)
+            ] if applied_query else vehicle_names
+
+            if applied_query and not matched_names:
+                st.warning(f'「{applied_query}」에 해당하는 차량을 찾지 못했습니다.')
+                selected_vehicle = None
+            else:
+                if applied_query:
+                    st.caption(f'조회 결과 · {len(matched_names):,}대')
+                selected_vehicle = st.selectbox(
+                    '차량 선택',
+                    matched_names,
+                    key='vehicle_focus_select'
+                ) if matched_names else None
+
+            focus = next(
+                (r for r in vehicle_rows_all if r['차량번호'] == selected_vehicle),
+                None
+            ) if selected_vehicle else None
 
             if focus:
                 c1, c2, c3, c4, c5 = st.columns(5)
@@ -749,8 +889,8 @@ def render(mode, can_edit, actor, store):
             # ── 전체 차량 비교: 변동이 있는 차량을 한 차트에 표시
             h1, h2 = st.columns([1.2, 1])
             vsearch = h1.text_input(
-                '차량번호 검색',
-                placeholder='예: 경북80아9992',
+                '전체 차량표 필터',
+                placeholder='전체 차량번호 또는 뒤 4자리',
                 key='vehicle_issue_search'
             ).strip()
             issue_only = h2.toggle(
@@ -763,7 +903,7 @@ def render(mode, can_edit, actor, store):
             if vsearch:
                 vehicle_rows = [
                     r for r in vehicle_rows
-                    if vsearch.lower() in r['차량번호'].lower()
+                    if vehicle_matches_query(r['차량번호'], vsearch)
                 ]
             if issue_only:
                 vehicle_rows = [r for r in vehicle_rows if r['변동합계'] > 0]
@@ -860,209 +1000,209 @@ def render(mode, can_edit, actor, store):
                 st.info('표시할 차량이 없습니다.')
 
     # ─────────────────────────────────────────────────────────────
-    # 4. 자료등록
+    # 4. 자료등록 · 관리자 전용
     # ─────────────────────────────────────────────────────────────
-    with tab_input:
-        st.subheader('새 배차자료 등록')
-        st.caption('Excel 파일 자체는 올리지 않고 필요한 열만 복사해서 붙여넣습니다.')
+    if tab_input is not None:
+        with tab_input:
+            st.subheader('새 배차자료 등록')
+            st.caption('Excel 파일 자체는 올리지 않고 필요한 열만 복사해서 붙여넣습니다.')
 
-        if mode == 'demo':
-            st.info('현재는 예시 모드입니다.')
-            return
-        if not can_edit:
-            st.warning('현재 계정은 조회 전용입니다. 자료 등록 권한이 없습니다.')
-            return
+            if mode == 'demo':
+                st.info('현재는 예시 모드입니다.')
+                return
+            if not can_edit:
+                st.warning('현재 계정은 조회 전용입니다. 자료 등록 권한이 없습니다.')
+                return
 
-        default_day = (
-            date.fromisoformat(selected)
-            if selected != NEW_LABEL
-            else datetime.now(ZoneInfo("Asia/Seoul")).date()
-        )
-        paste_day = st.date_input(
-            '배차일',
-            value=default_day,
-            key='simple_paste_day',
-            help='이 날짜 기준으로 저장되고 나중에 다시 조회할 수 있습니다.'
-        )
-
-        st.markdown('### 1. 최초 배차 · 상세정보')
-        a1, a2 = st.columns(2)
-        paste_initial_id = a1.text_area(
-            '납품번호',
-            height=180,
-            placeholder='Excel의 납품번호 열을 복사해서 붙여넣기',
-            key='simple_initial_delivery'
-        )
-        paste_initial_vehicle = a2.text_area(
-            '배차차량',
-            height=180,
-            placeholder='Excel의 배차차량 열을 복사해서 붙여넣기',
-            key='simple_initial_vehicle'
-        )
-        if base:
-            st.caption('과거 배차일을 선택한 상태라면 위 두 칸을 비워두고 최종자료만 새로 입력해도 기존 최초배차를 사용합니다.')
-
-        st.markdown('### 2. 최종 배차 · 최종리스트')
-        b1, b2, b3 = st.columns(3)
-        paste_final_id = b1.text_area(
-            'Delivery',
-            height=190,
-            placeholder='Delivery 열 붙여넣기',
-            key='simple_final_delivery'
-        )
-        paste_final_vehicle = b2.text_area(
-            'Vehicle Number(Full)',
-            height=190,
-            placeholder='최종 차량번호 열 붙여넣기',
-            key='simple_final_vehicle'
-        )
-        paste_final_status = b3.text_area(
-            'PDAStepStatus',
-            height=190,
-            placeholder='상태코드 열 붙여넣기\n빈값도 정상입니다.',
-            key='simple_final_status'
-        )
-        st.caption('판정기준 · L·7 = 연기 / 3·P = 취소 / 빈값과 그 외 코드는 일반상태')
-
-        final_ready = bool(paste_final_id.strip() and paste_final_vehicle.strip())
-        initial_ready = bool(paste_initial_id.strip() and paste_initial_vehicle.strip()) or base is not None
-
-        if st.button(
-            '분석하기',
-            type='primary',
-            use_container_width=True,
-            disabled=not (initial_ready and final_ready),
-            key='simple_analyze'
-        ):
-            try:
-                first_doc, last_doc = read_pasted_columns(
-                    paste_initial_id,
-                    paste_initial_vehicle,
-                    paste_final_id,
-                    paste_final_vehicle,
-                    paste_final_status,
-                    use_saved_initial=(
-                        base['initial']
-                        if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
-                        else None
-                    ),
-                    comparison_date=paste_day.isoformat()
-                )
-                st.session_state['delivery_preview'] = {
-                    'selected': selected,
-                    'comparison_date': paste_day.isoformat(),
-                    'initial': first_doc,
-                    'final': last_doc,
-                    'initial_name': (
-                        base['initial_name']
-                        if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
-                        else '상세정보 · 복사붙여넣기'
-                    ),
-                    'final_name': '최종리스트 · 복사붙여넣기'
-                }
-                st.session_state['simple_analyzed_notice'] = True
-                st.rerun()
-            except CompareError as exc:
-                st.error(str(exc))
-
-        if st.session_state.pop('simple_analyzed_notice', False):
-            st.success('분석 완료 · 「한눈에 보기」 탭에서 결과를 확인하세요.')
-
-        # 현재 미리보기가 있으면 저장 버튼만 단순하게 표시
-        preview = st.session_state.get('delivery_preview')
-        current = preview if preview and preview.get('selected') == selected else work
-        if current and repository:
-            st.divider()
-            st.markdown('### 3. 저장')
-            save_day_text = current.get('comparison_date', paste_day.isoformat())
-            try:
-                save_day_default = date.fromisoformat(save_day_text)
-            except Exception:
-                save_day_default = paste_day
-
-            save_day = st.date_input(
-                '저장할 배차일',
-                value=save_day_default,
-                key='simple_save_day'
+            default_day = (
+                date.fromisoformat(selected)
+                if selected != NEW_LABEL
+                else datetime.now(ZoneInfo("Asia/Seoul")).date()
             )
-            confirmed = st.checkbox(
-                '분석 결과를 확인했고 이 배차일로 저장합니다.',
-                key='simple_save_confirm'
+            paste_day = st.date_input(
+                '배차일',
+                value=default_day,
+                key='simple_paste_day',
+                help='이 날짜 기준으로 저장되고 나중에 다시 조회할 수 있습니다.'
             )
+
+            st.markdown('### 1. 최초 배차 · 상세정보')
+            a1, a2 = st.columns(2)
+            paste_initial_id = a1.text_area(
+                '납품번호',
+                height=180,
+                placeholder='Excel의 납품번호 열을 복사해서 붙여넣기',
+                key='simple_initial_delivery'
+            )
+            paste_initial_vehicle = a2.text_area(
+                '배차차량',
+                height=180,
+                placeholder='Excel의 배차차량 열을 복사해서 붙여넣기',
+                key='simple_initial_vehicle'
+            )
+            if base:
+                st.caption('과거 배차일을 선택한 상태라면 위 두 칸을 비워두고 최종자료만 새로 입력해도 기존 최초배차를 사용합니다.')
+
+            st.markdown('### 2. 최종 배차 · 최종리스트')
+            b1, b2, b3 = st.columns(3)
+            paste_final_id = b1.text_area(
+                'Delivery',
+                height=190,
+                placeholder='Delivery 열 붙여넣기',
+                key='simple_final_delivery'
+            )
+            paste_final_vehicle = b2.text_area(
+                'Vehicle Number(Full)',
+                height=190,
+                placeholder='최종 차량번호 열 붙여넣기',
+                key='simple_final_vehicle'
+            )
+            paste_final_status = b3.text_area(
+                'PDAStepStatus',
+                height=190,
+                placeholder='상태코드 열 붙여넣기\n빈값도 정상입니다.',
+                key='simple_final_status'
+            )
+            st.caption('판정기준 · L·7 = 연기 / 3·P = 취소 / 빈값과 그 외 코드는 일반상태')
+
+            final_ready = bool(paste_final_id.strip() and paste_final_vehicle.strip())
+            initial_ready = bool(paste_initial_id.strip() and paste_initial_vehicle.strip()) or base is not None
+
             if st.button(
-                'Supabase에 저장',
+                '분석하기',
                 type='primary',
                 use_container_width=True,
-                disabled=not confirmed,
-                key='simple_save'
+                disabled=not (initial_ready and final_ready),
+                key='simple_analyze'
             ):
                 try:
-                    n = repository.save(
-                        save_day.isoformat(),
-                        current['initial'],
-                        current['final'],
-                        actor,
-                        current['initial_name'],
-                        current['final_name']
+                    first_doc, last_doc = read_pasted_columns(
+                        paste_initial_id,
+                        paste_initial_vehicle,
+                        paste_final_id,
+                        paste_final_vehicle,
+                        paste_final_status,
+                        use_saved_initial=(
+                            base['initial']
+                            if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
+                            else None
+                        ),
+                        comparison_date=paste_day.isoformat()
                     )
-                    st.success(f'저장 완료 · 신규 데이터셋 {n}개')
-                except CompareError as exc:
-                    st.error(str(exc))
-                except Exception:
-                    st.error('저장에 실패했습니다. 데이터베이스 연결을 확인하세요.')
-
-        # CSV는 숨겨진 보조 기능으로만 유지
-        with st.expander('기타 · CSV 업로드 / 백업'):
-            st.caption('회사 환경에서 CSV가 정상적으로 읽히는 경우에만 사용하세요.')
-            c1, c2 = st.columns(2)
-            first_upload = c1.file_uploader(
-                '상세정보.csv',
-                type=['csv'],
-                key='simple_csv_initial'
-            )
-            last_upload = c2.file_uploader(
-                '최종리스트.csv',
-                type=['csv'],
-                key='simple_csv_final'
-            )
-            if st.button(
-                'CSV 분석',
-                disabled=last_upload is None or (first_upload is None and base is None),
-                key='simple_csv_analyze'
-            ):
-                try:
-                    first_doc = (
-                        read_csv_source(first_upload.getvalue(), 'initial', first_upload.name)
-                        if first_upload else base['initial']
-                    )
-                    last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
                     st.session_state['delivery_preview'] = {
                         'selected': selected,
-                        'comparison_date': selected if selected != NEW_LABEL else '',
+                        'comparison_date': paste_day.isoformat(),
                         'initial': first_doc,
                         'final': last_doc,
-                        'initial_name': first_upload.name if first_upload else base['initial_name'],
-                        'final_name': last_upload.name
+                        'initial_name': (
+                            base['initial_name']
+                            if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
+                            else '상세정보 · 복사붙여넣기'
+                        ),
+                        'final_name': '최종리스트 · 복사붙여넣기'
                     }
+                    st.session_state['simple_analyzed_notice'] = True
                     st.rerun()
                 except CompareError as exc:
                     st.error(str(exc))
 
-            if current:
-                backup_day = current.get('comparison_date', '')
-                backup = json.dumps({
-                    'schema_version': 3,
-                    'comparison_date': backup_day,
-                    'initial': current['initial'],
-                    'final': current['final'],
-                    'delay_codes': list(DELAY_CODES),
-                    'cancel_codes': list(CANCEL_CODES)
-                }, ensure_ascii=False, indent=2).encode('utf8')
-                st.download_button(
-                    '현재 비교자료 JSON 백업',
-                    backup,
-                    file_name='납품번호비교_백업.json',
-                    mime='application/json',
-                    key='simple_backup'
-                )
+            if st.session_state.pop('simple_analyzed_notice', False):
+                st.success('분석 완료 · 「한눈에 보기」 탭에서 결과를 확인하세요.')
 
+            # 현재 미리보기가 있으면 저장 버튼만 단순하게 표시
+            preview = st.session_state.get('delivery_preview')
+            current = preview if preview and preview.get('selected') == selected else work
+            if current and repository:
+                st.divider()
+                st.markdown('### 3. 저장')
+                save_day_text = current.get('comparison_date', paste_day.isoformat())
+                try:
+                    save_day_default = date.fromisoformat(save_day_text)
+                except Exception:
+                    save_day_default = paste_day
+
+                save_day = st.date_input(
+                    '저장할 배차일',
+                    value=save_day_default,
+                    key='simple_save_day'
+                )
+                confirmed = st.checkbox(
+                    '분석 결과를 확인했고 이 배차일로 저장합니다.',
+                    key='simple_save_confirm'
+                )
+                if st.button(
+                    'Supabase에 저장',
+                    type='primary',
+                    use_container_width=True,
+                    disabled=not confirmed,
+                    key='simple_save'
+                ):
+                    try:
+                        n = repository.save(
+                            save_day.isoformat(),
+                            current['initial'],
+                            current['final'],
+                            actor,
+                            current['initial_name'],
+                            current['final_name']
+                        )
+                        st.success(f'저장 완료 · 신규 데이터셋 {n}개')
+                    except CompareError as exc:
+                        st.error(str(exc))
+                    except Exception:
+                        st.error('저장에 실패했습니다. 데이터베이스 연결을 확인하세요.')
+
+            # CSV는 숨겨진 보조 기능으로만 유지
+            with st.expander('기타 · CSV 업로드 / 백업'):
+                st.caption('회사 환경에서 CSV가 정상적으로 읽히는 경우에만 사용하세요.')
+                c1, c2 = st.columns(2)
+                first_upload = c1.file_uploader(
+                    '상세정보.csv',
+                    type=['csv'],
+                    key='simple_csv_initial'
+                )
+                last_upload = c2.file_uploader(
+                    '최종리스트.csv',
+                    type=['csv'],
+                    key='simple_csv_final'
+                )
+                if st.button(
+                    'CSV 분석',
+                    disabled=last_upload is None or (first_upload is None and base is None),
+                    key='simple_csv_analyze'
+                ):
+                    try:
+                        first_doc = (
+                            read_csv_source(first_upload.getvalue(), 'initial', first_upload.name)
+                            if first_upload else base['initial']
+                        )
+                        last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
+                        st.session_state['delivery_preview'] = {
+                            'selected': selected,
+                            'comparison_date': selected if selected != NEW_LABEL else '',
+                            'initial': first_doc,
+                            'final': last_doc,
+                            'initial_name': first_upload.name if first_upload else base['initial_name'],
+                            'final_name': last_upload.name
+                        }
+                        st.rerun()
+                    except CompareError as exc:
+                        st.error(str(exc))
+
+                if current:
+                    backup_day = current.get('comparison_date', '')
+                    backup = json.dumps({
+                        'schema_version': 3,
+                        'comparison_date': backup_day,
+                        'initial': current['initial'],
+                        'final': current['final'],
+                        'delay_codes': list(DELAY_CODES),
+                        'cancel_codes': list(CANCEL_CODES)
+                    }, ensure_ascii=False, indent=2).encode('utf8')
+                    st.download_button(
+                        '현재 비교자료 JSON 백업',
+                        backup,
+                        file_name='납품번호비교_백업.json',
+                        mime='application/json',
+                        key='simple_backup'
+                    )
