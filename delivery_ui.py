@@ -167,7 +167,7 @@ def _paste_lines(raw: str, header_names=()):
 
 def read_pasted_columns(initial_delivery: str, initial_vehicle: str,
                         final_delivery: str, final_vehicle: str, final_status: str,
-                        use_saved_initial=None):
+                        use_saved_initial=None, comparison_date: str = ''):
     """파일을 올리지 않고 Excel 열 복사/붙여넣기만으로 비교용 자료를 만듭니다."""
     if use_saved_initial is None:
         a_id = _paste_lines(initial_delivery, ('납품번호', 'Delivery'))
@@ -199,12 +199,21 @@ def read_pasted_columns(initial_delivery: str, initial_vehicle: str,
     b_id = _paste_lines(final_delivery, ('Delivery', '납품번호'))
     b_vehicle = _paste_lines(final_vehicle, ('Vehicle Number(Full)', 'VehicleNumber(Full)', 'Vehicle Number'))
     b_status = _paste_lines(final_status, ('PDAStepStatus', 'PDA Step Status'))
-    if not b_id or not b_vehicle or not b_status:
-        raise CompareError('최종리스트의 Delivery, Vehicle Number(Full), PDAStepStatus를 각각 붙여넣어 주세요.')
-    if len({len(b_id), len(b_vehicle), len(b_status)}) != 1:
+    if not b_id or not b_vehicle:
+        raise CompareError('최종리스트의 Delivery와 Vehicle Number(Full)를 각각 붙여넣어 주세요.')
+    if len(b_id) != len(b_vehicle):
         raise CompareError(
             f'최종리스트 행 수가 다릅니다. Delivery {len(b_id):,}행 / '
-            f'차량 {len(b_vehicle):,}행 / PDAStepStatus {len(b_status):,}행. 같은 범위를 복사해 주세요.'
+            f'차량 {len(b_vehicle):,}행. 같은 범위를 복사해 주세요.'
+        )
+    # PDAStepStatus는 빈값도 정상값으로 사용합니다.
+    # 열 전체가 비었거나 끝부분이 빈 셀인 경우 Delivery 행수만큼 빈값으로 채웁니다.
+    if len(b_status) < len(b_id):
+        b_status = b_status + [''] * (len(b_id) - len(b_status))
+    elif len(b_status) > len(b_id):
+        raise CompareError(
+            f'PDAStepStatus 행수가 Delivery보다 많습니다. Delivery {len(b_id):,}행 / '
+            f'PDAStepStatus {len(b_status):,}행. 같은 시작행·끝행을 복사해 주세요.'
         )
     final_rows = []
     for i, (ident, truck, status) in enumerate(zip(b_id, b_vehicle, b_status), start=1):
@@ -220,7 +229,7 @@ def read_pasted_columns(initial_delivery: str, initial_vehicle: str,
             'id': ident, 'row': i, 'vehicle': vehicle(truck),
             'item': '', 'qty': None, 'volume': None, 'volume_unit': '',
             'model': '', 'code': text(status).upper(), 'description': '',
-            'route': '', 'op_date': '', 'book_date': '', 'assign_date': ''
+            'route': '', 'op_date': comparison_date, 'book_date': '', 'assign_date': ''
         })
     if not final_rows:
         raise CompareError('최종리스트 붙여넣기 자료가 없습니다.')
@@ -233,6 +242,8 @@ def build_comparison_local(initial, final):
     delays = set(DELAY_CODES)
     cancels = set(CANCEL_CODES)
     a, b = aggregate(initial), aggregate(final)
+    op_dates = sorted({r.get('op_date', '') for r in final.get('rows', []) if r.get('op_date')})
+    comparison_day = op_dates[0] if len(op_dates) == 1 else ' / '.join(op_dates)
     rows = []
     for ident in sorted(set(a) | set(b)):
         first, last = a.get(ident), b.get(ident)
@@ -252,17 +263,20 @@ def build_comparison_local(initial, final):
         codes = (last or {}).get('codes', [])
         if not last:
             status = '최종미존재'
-        elif not codes or '' in codes:
-            status = '상태 확인필요'
-        elif all(x in delays for x in codes):
-            status = '연기'
-        elif all(x in cancels for x in codes):
-            status = '취소'
-        elif any(x in delays or x in cancels for x in codes):
-            status = '상태 혼합 확인'
         else:
-            status = '일반상태'
+            # 빈 PDAStepStatus도 정상 일반상태로 취급합니다.
+            # 한 Delivery에 여러 품목행이 있으면 각 상태를 분류한 뒤 서로 다를 때만 혼합으로 표시합니다.
+            code_categories = set()
+            for x in codes or ['']:
+                if x in delays:
+                    code_categories.add('연기')
+                elif x in cancels:
+                    code_categories.add('취소')
+                else:
+                    code_categories.add('일반상태')
+            status = next(iter(code_categories)) if len(code_categories) == 1 else '상태 혼합 확인'
         rows.append({
+            '배차일': comparison_day,
             '납품번호 / Delivery': ident, '매칭구분': matching,
             '최초 차량번호': ' / '.join(av), '최종 차량번호': ' / '.join(bv),
             '차량 이동': movement, '처리구분': status,
@@ -365,294 +379,548 @@ def show_table(rows, key, height=420):
     st.download_button('이 표 CSV 내려받기', csv_bytes(rows), file_name=key + '.csv', mime='text/csv', key='download_' + key)
 
 def render(mode, can_edit, actor, store):
-    st.subheader('상세정보 → 최종리스트 · 납품번호별 차량 이동')
-    st.caption('최초: 상세정보의 납품번호·배차차량 / 최종: 최종리스트의 Delivery·Vehicle Number(Full) · 복사/붙여넣기 지원')
+    # ─────────────────────────────────────────────────────────────
+    # 간편 UI: 조회 화면과 자료등록 화면을 분리해 한눈에 보이도록 구성
+    # ─────────────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    .block-container {max-width: 1500px; padding-top: 1.4rem; padding-bottom: 3rem;}
+    h1, h2, h3 {letter-spacing: -0.035em;}
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e9edf2;
+        border-radius: 16px;
+        padding: 18px 18px 14px 18px;
+        box-shadow: 0 2px 10px rgba(20,35,55,.04);
+    }
+    [data-testid="stMetricLabel"] {font-weight: 700;}
+    [data-testid="stMetricValue"] {font-size: 1.9rem;}
+    div[data-testid="stTabs"] button {font-weight: 700;}
+    .dispatch-head {
+        border: 1px solid #e9edf2;
+        background: #ffffff;
+        border-radius: 18px;
+        padding: 20px 22px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(20,35,55,.04);
+    }
+    .dispatch-head .title {font-size: 1.45rem; font-weight: 800; letter-spacing: -.04em;}
+    .dispatch-head .sub {font-size: .88rem; color: #6b7280; margin-top: 5px;}
+    .soft-note {
+        background: #f8fafc;
+        border: 1px solid #edf1f5;
+        border-radius: 12px;
+        padding: 12px 14px;
+        color: #667085;
+        font-size: .86rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="dispatch-head">
+      <div class="title">🚚 가전운송 배차 현황</div>
+      <div class="sub">최초 배차와 변경 후 최종 배차를 납품번호 기준으로 비교합니다.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
     repository = None
     base = None
-    selected = '새 파일 비교'
+    NEW_LABEL = '➕ 새 배차 등록'
+    saved_days = []
+
     if store:
         try:
             repository = PairStore(store)
-            selected = st.sidebar.selectbox('저장한 비교일', ['새 파일 비교'] + repository.list_ids(), key='pair_id')
-            if selected != '새 파일 비교':
-                base = repository.load(selected)
-                versions = base['versions']
-                if versions:
-                    hashes = [v['hash'] for v in versions]
-                    version_label = {v['hash']: v['등록시각(UTC)'][:19] + ' UTC · ' + v['파일명'] for v in versions}
-                    chosen = st.sidebar.selectbox('최종 파일 등록 버전', hashes, index=len(hashes)-1, format_func=lambda x: version_label[x], key='pair_version_' + selected)
-                    base = repository.load(selected, chosen)
+            saved_days = repository.list_ids()
         except Exception:
-            st.error('납품번호 비교 저장소를 읽을 수 없습니다. 연결정보와 데이터베이스 권한을 확인하세요.')
+            st.error('저장된 배차자료를 읽을 수 없습니다. 데이터베이스 연결을 확인하세요.')
             return
+
+    # 상단의 날짜 선택만 남기고 사이드바의 복잡한 필터는 제거
+    top1, top2 = st.columns([1.15, 1.85])
+    options = [NEW_LABEL] + saved_days
+    selected = top1.selectbox(
+        '배차일 선택',
+        options,
+        key='pair_day_simple',
+        help='과거 자료를 보려면 날짜를 선택하고, 새 자료를 넣으려면 새 배차 등록을 선택하세요.'
+    )
+
+    if selected != NEW_LABEL and repository:
+        try:
+            base = repository.load(selected)
+            versions = base.get('versions', [])
+            if versions:
+                hashes = [v['hash'] for v in versions]
+                labels = {
+                    v['hash']: (
+                        v['등록시각(UTC)'][:19] + ' UTC'
+                        + (' · ' + v['파일명'] if v.get('파일명') else '')
+                    )
+                    for v in versions
+                }
+                chosen = top2.selectbox(
+                    '최종자료 버전',
+                    hashes,
+                    index=len(hashes) - 1,
+                    format_func=lambda x: labels[x],
+                    key='pair_version_simple_' + selected
+                )
+                base = repository.load(selected, chosen)
+            if base is not None:
+                base['comparison_date'] = selected
+        except Exception:
+            st.error('선택한 배차일의 자료를 불러오지 못했습니다.')
+            return
+    else:
+        top2.markdown(
+            '<div class="soft-note" style="margin-top:29px">새 배차자료는 아래 <b>자료등록</b> 탭에서 붙여넣으면 됩니다.</div>',
+            unsafe_allow_html=True
+        )
+
     if mode == 'demo':
         initial, final = demo_pair()
-        work = {'initial': initial, 'final': final, 'initial_name': '가상 예시', 'final_name': '가상 예시'}
+        work = {
+            'selected': NEW_LABEL,
+            'comparison_date': '',
+            'initial': initial,
+            'final': final,
+            'initial_name': '가상 예시',
+            'final_name': '가상 예시'
+        }
     else:
         work = base
         preview = st.session_state.get('delivery_preview')
         if preview and preview.get('selected') == selected:
             work = preview
-        with st.expander('① Excel에서 필요한 열만 복사 · 붙여넣기 (권장)', expanded=work is None):
-            st.info(
-                '파일 업로드나 CSV 저장 없이 사용합니다. Excel 원본은 회사 PC에서 그대로 열고, '
-                '아래 필요한 열의 데이터만 복사(Ctrl+C)해서 붙여넣으세요(Ctrl+V). '
-                '고객명·주소·전화번호는 붙여넣지 않습니다.'
+
+    # 분석결과는 한 번만 계산해서 모든 탭에서 공유
+    result = None
+    all_rows = []
+    visible_day = ''
+    if work:
+        result = build_comparison_local(work['initial'], work['final'])
+        all_rows = result['rows']
+        visible_day = work.get('comparison_date', '') if isinstance(work, dict) else ''
+        if not visible_day:
+            days = sorted({r.get('배차일', '') for r in all_rows if r.get('배차일')})
+            visible_day = days[0] if len(days) == 1 else ''
+
+    tab_dash, tab_delivery, tab_vehicle, tab_input = st.tabs([
+        '📊 한눈에 보기',
+        '🔎 납품번호 조회',
+        '🚛 차량별 현황',
+        '➕ 자료등록'
+    ])
+
+    # ─────────────────────────────────────────────────────────────
+    # 1. 한눈에 보기
+    # ─────────────────────────────────────────────────────────────
+    with tab_dash:
+        if not work:
+            st.info('저장된 배차일을 선택하거나, 「자료등록」 탭에서 새 배차자료를 등록하세요.')
+        else:
+            if visible_day:
+                st.caption(f'조회 배차일 · {visible_day}')
+
+            initial_count = sum(r['매칭구분'] != '최종만 존재' for r in all_rows)
+            final_listed_count = sum(r['매칭구분'] != '최종미존재' for r in all_rows)
+            delay_count = sum(r['처리구분'] == '연기' for r in all_rows)
+            cancel_count = sum(r['처리구분'] == '취소' for r in all_rows)
+            final_dispatch_count = max(0, final_listed_count - delay_count - cancel_count)
+            moved_count = sum(r['차량 이동'] == '배차변경' for r in all_rows)
+
+            # 가장 중요한 5개만 크게 표시
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric('최초 배차건수', f'{initial_count:,} 건')
+            c2.metric('최종 배차건수', f'{final_dispatch_count:,} 건',
+                      f'{final_dispatch_count - initial_count:+,} 건', delta_color='off')
+            c3.metric('차량 변경', f'{moved_count:,} 건')
+            c4.metric('연기', f'{delay_count:,} 건')
+            c5.metric('취소', f'{cancel_count:,} 건')
+
+            st.caption(
+                f'최종 배차건수 = 최종 원본등재 {final_listed_count:,}건 '
+                f'- 연기 {delay_count:,}건 - 취소 {cancel_count:,}건'
             )
-            st.warning(
-                '주의: 붙여넣은 납품번호·차량번호·상태코드는 Streamlit 서버로 전송됩니다. '
-                '회사 정책이 외부 전송 자체를 금지한다면 이 방법도 사용하지 말고 IT 담당자에게 확인하세요.'
+
+            missing_count = sum(r['매칭구분'] == '최종미존재' for r in all_rows)
+            extra_count = sum(r['매칭구분'] == '최종만 존재' for r in all_rows)
+            if missing_count or extra_count:
+                st.info(
+                    f'참고 · 최초에만 존재 {missing_count:,}건 / 최종에만 존재 {extra_count:,}건 '
+                    '→ 자동으로 취소 처리하지 않고 별도 확인합니다.'
+                )
+
+            st.divider()
+
+            # 검색/필터도 한 줄로만
+            f1, f2 = st.columns([1.5, 1])
+            search = f1.text_input(
+                '검색',
+                placeholder='납품번호 또는 차량번호 검색',
+                key='simple_search'
+            ).strip()
+            quick = f2.radio(
+                '빠른 보기',
+                ['전체', '차량변경', '연기', '취소'],
+                horizontal=True,
+                key='simple_quick'
             )
-            if not can_edit:
-                st.caption('조회 전용 계정입니다. 편집 권한이 있는 담당자가 자료를 등록해야 합니다.')
+
+            filtered = []
+            for r in all_rows:
+                if search:
+                    target = ' '.join([
+                        r['납품번호 / Delivery'],
+                        r['최초 차량번호'],
+                        r['최종 차량번호']
+                    ])
+                    if search.lower() not in target.lower():
+                        continue
+                if quick == '차량변경' and r['차량 이동'] != '배차변경':
+                    continue
+                if quick == '연기' and r['처리구분'] != '연기':
+                    continue
+                if quick == '취소' and r['처리구분'] != '취소':
+                    continue
+                filtered.append(r)
+
+            compact = [{
+                '배차일': r.get('배차일', ''),
+                '납품번호': r['납품번호 / Delivery'],
+                '최초 차량': r['최초 차량번호'],
+                '최종 차량': r['최종 차량번호'],
+                '차량 이동': r['차량 이동'],
+                '상태': r['처리구분'],
+                'PDA': r['PDAStepStatus'],
+            } for r in filtered]
+
+            st.markdown(f'**배차내역 · {len(compact):,}건**')
+            if compact:
+                st.dataframe(compact, hide_index=True, use_container_width=True, height=520)
+                st.download_button(
+                    '현재 목록 CSV 내려받기',
+                    csv_bytes(compact),
+                    file_name=f'배차현황_{visible_day or "조회"}.csv',
+                    mime='text/csv',
+                    key='simple_download'
+                )
             else:
-                st.markdown('**A. 상세정보(최초배차)** · Excel에서 같은 행 범위를 각각 복사합니다.')
-                a1, a2 = st.columns(2)
-                paste_initial_id = a1.text_area(
-                    '납품번호 열 붙여넣기',
-                    height=170,
-                    placeholder='예)\n7366379419\n7366379420\n7366379421',
-                    key='paste_initial_delivery'
-                )
-                paste_initial_vehicle = a2.text_area(
-                    '배차차량 열 붙여넣기',
-                    height=170,
-                    placeholder='예)\n경북80아9992\n경북86아6723\n경북80아9912',
-                    key='paste_initial_vehicle'
-                )
-                if base:
-                    st.caption('왼쪽에서 저장된 비교일을 선택한 경우, 위 상세정보 두 칸을 비워두면 저장된 최초배차를 그대로 사용합니다.')
+                st.info('조건에 맞는 내역이 없습니다.')
 
-                st.markdown('**B. 최종리스트(변경 후 최종)** · 세 열 모두 같은 행 범위를 복사합니다.')
-                b1, b2, b3 = st.columns(3)
-                paste_final_id = b1.text_area(
-                    'Delivery 열 붙여넣기',
-                    height=190,
-                    placeholder='예)\n7366379419\n7366379420',
-                    key='paste_final_delivery'
-                )
-                paste_final_vehicle = b2.text_area(
-                    'Vehicle Number(Full) 열 붙여넣기',
-                    height=190,
-                    placeholder='예)\n경북80아9938\n경북86아6723',
-                    key='paste_final_vehicle'
-                )
-                paste_final_status = b3.text_area(
-                    'PDAStepStatus 열 붙여넣기',
-                    height=190,
-                    placeholder='예)\nL\n3',
-                    key='paste_final_status'
-                )
-                st.caption('열 제목까지 같이 복사해도 자동으로 제외합니다. 빈 행이 섞이지 않도록 같은 시작행·끝행을 선택하세요.')
-                final_ready = bool(paste_final_id.strip() and paste_final_vehicle.strip() and paste_final_status.strip())
-                initial_ready = bool(paste_initial_id.strip() and paste_initial_vehicle.strip()) or base is not None
-                if st.button('붙여넣은 자료 분석하기', type='primary',
-                             disabled=not (initial_ready and final_ready), key='pair_analyze_paste'):
-                    try:
-                        first_doc, last_doc = read_pasted_columns(
-                            paste_initial_id, paste_initial_vehicle,
-                            paste_final_id, paste_final_vehicle, paste_final_status,
-                            use_saved_initial=(base['initial'] if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip()) else None)
-                        )
-                        work = {
-                            'selected': selected,
-                            'initial': first_doc,
-                            'final': last_doc,
-                            'initial_name': (base['initial_name'] if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip()) else '상세정보 · 복사붙여넣기'),
-                            'final_name': '최종리스트 · 복사붙여넣기'
+    # ─────────────────────────────────────────────────────────────
+    # 2. 납품번호 조회
+    # ─────────────────────────────────────────────────────────────
+    with tab_delivery:
+        if not work:
+            st.info('먼저 저장된 날짜를 선택하거나 새 자료를 등록하세요.')
+        else:
+            st.subheader('납품번호 하나만 빠르게 확인')
+            q = st.text_input(
+                '납품번호 / Delivery',
+                placeholder='납품번호 입력',
+                key='delivery_exact_search'
+            ).strip()
+
+            candidates = all_rows
+            if q:
+                candidates = [r for r in all_rows if q in r['납품번호 / Delivery']]
+
+            if not q:
+                st.caption('납품번호를 입력하면 최초 차량 → 최종 차량과 연기·취소 여부를 바로 보여줍니다.')
+            elif not candidates:
+                st.warning('해당 납품번호를 찾지 못했습니다.')
+            else:
+                choices = [r['납품번호 / Delivery'] for r in candidates]
+                delivery = st.selectbox('조회 결과', choices, key='delivery_exact_select')
+                detail = next(r for r in candidates if r['납품번호 / Delivery'] == delivery)
+
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric('최초 차량', detail['최초 차량번호'] or '없음')
+                d2.metric('최종 차량', detail['최종 차량번호'] or '없음')
+                d3.metric('차량 이동', detail['차량 이동'])
+                d4.metric('처리상태', detail['처리구분'])
+
+                st.markdown('**상세정보**')
+                detail_view = {
+                    '배차일': detail.get('배차일', ''),
+                    '납품번호 / Delivery': detail['납품번호 / Delivery'],
+                    '최초 차량번호': detail['최초 차량번호'],
+                    '최종 차량번호': detail['최종 차량번호'],
+                    'PDAStepStatus': detail['PDAStepStatus'] or '(빈값 · 일반상태)',
+                    '처리구분': detail['처리구분'],
+                    '매칭구분': detail['매칭구분'],
+                    '확인사항': detail['확인사항'],
+                }
+                st.dataframe([detail_view], hide_index=True, use_container_width=True)
+
+                if detail['차량 이동'] == '배차변경':
+                    st.success(
+                        f"{detail['최초 차량번호']} → {detail['최종 차량번호']} 로 배차가 변경되었습니다."
+                    )
+
+    # ─────────────────────────────────────────────────────────────
+    # 3. 차량별 현황
+    # ─────────────────────────────────────────────────────────────
+    with tab_vehicle:
+        if not work:
+            st.info('먼저 저장된 날짜를 선택하거나 새 자료를 등록하세요.')
+        else:
+            vehicle_rows = vehicle_summary_local(all_rows)
+            st.subheader('차량별 최초 ↔ 최종 배차건수')
+
+            vsearch = st.text_input(
+                '차량번호 검색',
+                placeholder='예: 경북80아9992',
+                key='vehicle_simple_search'
+            ).strip()
+            if vsearch:
+                vehicle_rows = [r for r in vehicle_rows if vsearch.lower() in r['차량번호'].lower()]
+
+            chart_rows = sorted(vehicle_rows, key=lambda x: abs(x['배차 증감']), reverse=True)[:20]
+            if chart_rows:
+                points = [
+                    {'차량번호': r['차량번호'], '시점': stage, '배차건수': r[key]}
+                    for r in chart_rows
+                    for stage, key in [('최초', '최초 배차건수'), ('최종', '최종 배차건수')]
+                ]
+                st.vega_lite_chart(
+                    spec={
+                        'data': {'values': points},
+                        'mark': {'type': 'bar', 'cornerRadiusEnd': 3},
+                        'encoding': {
+                            'x': {'field': '차량번호', 'type': 'nominal', 'axis': {'labelAngle': -40}},
+                            'xOffset': {'field': '시점'},
+                            'y': {'field': '배차건수', 'type': 'quantitative'},
+                            'color': {'field': '시점', 'type': 'nominal'},
+                            'tooltip': [
+                                {'field': '차량번호'},
+                                {'field': '시점'},
+                                {'field': '배차건수'}
+                            ]
                         }
-                        st.session_state['delivery_preview'] = work
-                        st.success('분석했습니다. 아직 저장소에 등록하지 않은 미리보기입니다.')
-                    except CompareError as exc:
-                        st.error(str(exc))
+                    },
+                    use_container_width=True
+                )
 
-        with st.expander('CSV 파일 업로드 · 가능한 경우에만 사용', expanded=False):
-            st.caption('회사 환경에서 CSV 업로드가 정상 동작할 때만 사용하는 보조 방식입니다.')
-            if can_edit:
-                c1, c2 = st.columns(2)
-                first_upload = c1.file_uploader('최초배차 · 상세정보.csv', type=['csv'], key='pair_first_upload')
-                last_upload = c2.file_uploader('최종배차 · 최종리스트.csv', type=['csv'], key='pair_final_upload')
-                if st.button('CSV 두 파일 분석하기', disabled=last_upload is None or (first_upload is None and base is None), key='pair_analyze_csv'):
-                    try:
-                        first_doc = read_csv_source(first_upload.getvalue(), 'initial', first_upload.name) if first_upload else base['initial']
-                        last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
-                        work = {
-                            'selected': selected, 'initial': first_doc, 'final': last_doc,
-                            'initial_name': first_upload.name if first_upload else base['initial_name'],
-                            'final_name': last_upload.name
-                        }
-                        st.session_state['delivery_preview'] = work
-                        st.success('분석했습니다. 아직 저장소에 등록하지 않은 미리보기입니다.')
-                    except CompareError as exc:
-                        st.error(str(exc))
+            compact_vehicle = [{
+                '차량번호': r['차량번호'],
+                '최초 배차': r['최초 배차건수'],
+                '최종 배차': r['최종 배차건수'],
+                '증감': r['배차 증감'],
+                '반출': r['반출'],
+                '반입': r['반입'],
+                '연기': r['연기 제외'],
+                '취소': r['취소 제외'],
+            } for r in vehicle_rows]
+            show_table(compact_vehicle, '차량별_배차현황', 500)
 
-        if work is None:
-            st.info('Excel에서 필요한 열을 복사해 위 입력칸에 붙여넣고 「붙여넣은 자료 분석하기」를 누르세요. 저장된 자료는 왼쪽에서 선택할 수 있습니다.')
+    # ─────────────────────────────────────────────────────────────
+    # 4. 자료등록
+    # ─────────────────────────────────────────────────────────────
+    with tab_input:
+        st.subheader('새 배차자료 등록')
+        st.caption('Excel 파일 자체는 올리지 않고 필요한 열만 복사해서 붙여넣습니다.')
+
+        if mode == 'demo':
+            st.info('현재는 예시 모드입니다.')
             return
-    st.sidebar.caption('상태 기준: L·7 = 연기 / 3·P = 취소')
-    result = build_comparison_local(work['initial'], work['final'])
-    all_rows = result['rows']
-    st.caption(f'원본: {work["initial_name"]} / {work["final_name"]} · 최초 완료시각은 파일에서 확인되지 않아 임의 생성하지 않습니다.')
-    date_counts = Counter(r.get('op_date') for r in work['final']['rows'] if r.get('op_date'))
-    if date_counts:
-        st.caption('최종 PlannedGIDate(CBO) 분포: ' + ', '.join(f'{d} ({n:,}품목행)' for d, n in date_counts.most_common()))
-        if len(date_counts) > 1:
-            st.warning('최종 파일에 여러 계획일이 포함되어 있습니다. 납품번호별 통합 비교이므로 두 파일의 조회 기간·대상 범위를 확인하세요.')
-    st.info('최종리스트는 품목 여러 행을 Delivery 1건으로 묶습니다. 차량 이동과 처리상태는 별도로 표시합니다.')
-    st.caption('PDAStepStatus 판정: L·7 = 연기 / 3·P = 취소. 원문 PDAStatusTxt도 함께 표시합니다.')
-    # Explicit, consistent filtering across every tab and KPI.
-    query = st.sidebar.text_input('납품번호 / Delivery 검색', key='pair_delivery_search').strip()
-    vehicles = sorted({v for r in all_rows for key in ('최초 차량번호', '최종 차량번호') for v in r[key].split(' / ') if v})
-    truck = st.sidebar.selectbox('차량번호 조회', ['전체'] + vehicles, key='pair_truck')
-    direction = st.sidebar.radio('차량 조회 기준', ['최초 또는 최종', '최초 차량', '최종 차량'], key='pair_truck_direction')
-    zones = sorted({r['최초 ZONE'] for r in all_rows if r['최초 ZONE']})
-    zone = st.sidebar.selectbox('최초 ZONE', ['전체'] + zones, key='pair_zone')
-    mapping = st.sidebar.multiselect(
-        '매칭구분',
-        ['양쪽 일치', '최종미존재', '최종만 존재'],
-        default=['양쪽 일치', '최종미존재', '최종만 존재'],
-        key='pair_matching'
-    )
-    quick_view = st.sidebar.radio(
-        '빠른 조회',
-        ['전체', '차량변경만', '연기만', '취소만'],
-        horizontal=False,
-        key='pair_quick_view'
-    )
-    rows = []
-    for r in all_rows:
-        if query and query not in r['납품번호 / Delivery']:
-            continue
-        if r['매칭구분'] not in mapping or (zone != '전체' and r['최초 ZONE'] != zone):
-            continue
-        truck_keys = ['최초 차량번호', '최종 차량번호'] if direction == '최초 또는 최종' else ['최초 차량번호' if direction == '최초 차량' else '최종 차량번호']
-        if truck != '전체' and not any(truck in r[k].split(' / ') for k in truck_keys):
-            continue
-        if quick_view == '차량변경만' and r['차량 이동'] != '배차변경':
-            continue
-        if quick_view == '연기만' and r['처리구분'] != '연기':
-            continue
-        if quick_view == '취소만' and r['처리구분'] != '취소':
-            continue
-        rows.append(r)
-    st.sidebar.caption('모든 표·지표는 위 검색과 필터 결과에 함께 적용됩니다. 셀 소속은 추정하지 않고 원본 ZONE만 표시합니다.')
-    initial_count = sum(r['매칭구분'] != '최종만 존재' for r in rows)
-    final_listed_count = sum(r['매칭구분'] != '최종미존재' for r in rows)
-    delay_count = sum(r['처리구분'] == '연기' for r in rows)
-    cancel_count = sum(r['처리구분'] == '취소' for r in rows)
-    # 사용자 업무기준: 최종 배차건수 = 최종 등재건수 - 연기 - 취소
-    final_dispatch_count = max(0, final_listed_count - delay_count - cancel_count)
-    stats = [
-        ('최초 배차건수', initial_count),
-        ('최종 배차건수', final_dispatch_count),
-        ('차량 변경', sum(r['차량 이동'] == '배차변경' for r in rows)),
-        ('연기', delay_count),
-        ('취소', cancel_count),
-        ('최종미존재', sum(r['매칭구분'] == '최종미존재' for r in rows)),
-        ('최종만 존재', sum(r['매칭구분'] == '최종만 존재' for r in rows)),
-    ]
-    for col, (label, value) in zip(st.columns(7), stats):
-        col.metric(label, f'{value:,} 건')
-    st.caption(
-        f'현재 필터: 고유 납품번호 {len(rows):,}건 · '
-        f'최종 원본등재 {final_listed_count:,}건 - 연기 {delay_count:,}건 - 취소 {cancel_count:,}건 '
-        f'= 최종 배차건수 {final_dispatch_count:,}건 · '
-        f'상태 혼합 확인 {sum(r["처리구분"] == "상태 혼합 확인" for r in rows):,}건.'
-    )
-    if result['metrics']['최종미존재'] or result['metrics']['최종만 존재']:
-        st.warning('한쪽 파일에만 존재하는 건은 별도 표시합니다. 최종에 없다는 이유만으로 취소·연기로 분류하지 않습니다. 두 파일의 조회 대상·기간을 확인하세요.')
-    t1, t2, t3, t4, t5 = st.tabs(['납품번호 조회', '차량 이동·반출입', '연기·취소 현황', '차량별 비교', '등록·검증 기준'])
-    with t1:
-        st.subheader('최초 차량에서 최종 어떤 차량으로 갔는지 확인')
-        show_table(rows, '납품번호별_차량조회', 460)
-        if rows:
-            delivery = st.selectbox('납품번호 상세 확인', [r['납품번호 / Delivery'] for r in rows], key='pair_detail_id')
-            detail = next(r for r in rows if r['납품번호 / Delivery'] == delivery)
-            c1, c2, c3 = st.columns(3)
-            c1.metric('최초 차량', detail['최초 차량번호'] or '원본에 없음')
-            c2.metric('최종 차량', detail['최종 차량번호'] or '원본에 없음')
-            c3.metric('상태', detail['처리구분'])
-            st.write('차량 이동: ' + detail['차량 이동'] + ' / PDAStepStatus: ' + (detail['PDAStepStatus'] or '없음'))
-            st.caption('원문 상태: ' + (detail['PDAStatusTxt(원문)'] or '없음'))
-            st.caption('근거 행(붙여넣기 또는 CSV 행번호) · 상세정보: ' + (detail['최초 근거행'] or '없음') + ' / 최종리스트: ' + (detail['최종 근거행'] or '없음'))
-            with st.expander('해당 납품번호 품목별 최종 원본값'):
-                item_rows = [{'Delivery': r['id'], 'item': r.get('item'), '최종 차량': r['vehicle'], 'Material': r.get('model'), 'Qty(첫 번째 열)': r.get('qty'), 'PDAStepStatus': r.get('code'), 'PDAStatusTxt': r.get('description'), 'CSV행': r['row']} for r in work['final']['rows'] if r['id'] == delivery]
-                show_table(item_rows, '선택납품_최종품목', 220)
-    with t2:
-        st.subheader('최초 차량 → 최종 차량 · 이동 요약')
-        moved = [r for r in rows if r['차량 이동'] == '배차변경']
-        show_table(transfer_summary_local(moved), '차량이동_방향별요약', 320)
-        st.subheader('이동한 납품번호 목록')
-        show_table(moved, '차량변경_납품상세')
-        st.caption('두 시점의 차량 차이입니다. 중간에 A→B→A로 돌아온 이력이나 정확한 이동시각은 두 파일만으로 알 수 없습니다.')
-    with t3:
-        st.subheader('연기 · 고유 Delivery 기준')
-        delay_rows = [r for r in rows if r['처리구분'] == '연기']
-        delay_counts = Counter(r['PDAStepStatus'] for r in delay_rows)
-        st.write(' · '.join(f'{code}: {n:,}건' for code, n in sorted(delay_counts.items())) or '연기 대상 없음')
-        show_table(delay_rows, '연기_납품상세', 280)
-        st.subheader('취소 · 고유 Delivery 기준')
-        cancel_rows = [r for r in rows if r['처리구분'] == '취소']
-        cancel_counts = Counter(r['PDAStepStatus'] for r in cancel_rows)
-        st.write(' · '.join(f'{code}: {n:,}건' for code, n in sorted(cancel_counts.items())) or '취소 대상 없음')
-        show_table(cancel_rows, '취소_납품상세', 280)
-        mixed_rows = [r for r in rows if r['처리구분'] == '상태 혼합 확인']
-        if mixed_rows:
-            st.subheader('상태 혼합 · 확인 필요')
-            show_table(mixed_rows, '상태혼합_확인필요', 220)
-        st.caption('고정 판정 규칙: L·7은 연기, 3·P는 취소입니다. 그 외 코드는 일반상태로 두며 임의로 완료라고 단정하지 않습니다.')
-    with t4:
-        st.subheader('차량별 최초·최종 배차건수와 반출입')
-        vehicle_rows = vehicle_summary_local(rows)
-        chart_rows = sorted(vehicle_rows, key=lambda x: abs(x['배차 증감']), reverse=True)[:20]
-        if chart_rows:
-            points = [{'차량번호': r['차량번호'], '시점': stage, '배차건수': r[key]} for r in chart_rows for stage, key in [('최초', '최초 배차건수'), ('최종', '최종 배차건수')]]
-            st.vega_lite_chart(spec={'data': {'values': points}, 'mark': 'bar', 'encoding': {
-                'x': {'field': '차량번호', 'type': 'nominal', 'axis': {'labelAngle': -45}},
-                'xOffset': {'field': '시점'}, 'y': {'field': '배차건수', 'type': 'quantitative'},
-                'color': {'field': '시점', 'type': 'nominal'}, 'tooltip': [{'field': '차량번호'}, {'field': '시점'}, {'field': '배차건수'}]}}, use_container_width=True)
-        show_table(vehicle_rows, '차량별_최초최종비교')
-        st.caption('최종 배차건수는 최종 원본등재건수에서 연기(L·7)와 취소(3·P)를 제외해 계산합니다. 원본등재 검산은 참고용입니다.')
-        st.caption('복수 차량으로 분할된 Delivery는 각 차량에 1건씩 포함되므로 차량 합계가 고유 Delivery 합계보다 클 수 있습니다. 해당 건은 확인사항에 표시합니다.')
-    with t5:
-        st.subheader('원본·중복·상태 검증')
-        st.write(result['metrics'])
-        issues = [r for r in rows if r['확인사항']]
-        if issues:
-            show_table(issues, '확인필요_납품목록', 240)
-        st.markdown('''**집계 기준**  
-- 납품번호 = Delivery. 숫자형·문자형 차이와 공백을 정리하되 문자 식별자의 앞자리 0은 임의 삭제하지 않습니다.
-- 최종 차량은 Vehicle Number(Full). 번호 뒷자리만으로 차량을 연결하지 않습니다.
-- Delivery 여러 품목행은 납품 1건. 품목별 상태가 섞이면 상태 혼합 확인으로 표시합니다.
-- **L·7 = 연기 / 3·P = 취소**로 판정합니다. 원문 상태 설명은 그대로 유지합니다.\n- **최종 배차건수 = 최종 원본등재건수 - 연기건수 - 취소건수**로 계산합니다.
-- 차량 변경과 처리상태는 독립 분류입니다. 누락·추가는 조회 범위 차이일 수 있습니다.
-- 최초 파일은 사용자 지정 기준본이며 정확한 최초 완료시각은 미제공입니다. 파일 등록시각을 완료시각으로 대체하지 않습니다.
-- 최종의 Qty 헤더가 두 번 나오면 품목 수량인 첫 번째 Qty 열만 사용합니다.
-- 정확히 같은 품목 중복은 수량 계산에서 한 번만 사용합니다. 같은 item의 상충 내용은 확인 대상으로 표시합니다.
-- 원본 두 파일은 전체 화면의 기준이며 임의로 같은 건수에 맞추거나 고객 방문수로 환산하지 않습니다.''')
-        if mode != 'demo' and repository and can_edit:
-            st.subheader('② 비교일별 저장 · 최초 고정 / 최종 버전 누적')
-            if len(date_counts) == 1:
+        if not can_edit:
+            st.warning('현재 계정은 조회 전용입니다. 자료 등록 권한이 없습니다.')
+            return
+
+        default_day = (
+            date.fromisoformat(selected)
+            if selected != NEW_LABEL
+            else datetime.now(ZoneInfo("Asia/Seoul")).date()
+        )
+        paste_day = st.date_input(
+            '배차일',
+            value=default_day,
+            key='simple_paste_day',
+            help='이 날짜 기준으로 저장되고 나중에 다시 조회할 수 있습니다.'
+        )
+
+        st.markdown('### 1. 최초 배차 · 상세정보')
+        a1, a2 = st.columns(2)
+        paste_initial_id = a1.text_area(
+            '납품번호',
+            height=180,
+            placeholder='Excel의 납품번호 열을 복사해서 붙여넣기',
+            key='simple_initial_delivery'
+        )
+        paste_initial_vehicle = a2.text_area(
+            '배차차량',
+            height=180,
+            placeholder='Excel의 배차차량 열을 복사해서 붙여넣기',
+            key='simple_initial_vehicle'
+        )
+        if base:
+            st.caption('과거 배차일을 선택한 상태라면 위 두 칸을 비워두고 최종자료만 새로 입력해도 기존 최초배차를 사용합니다.')
+
+        st.markdown('### 2. 최종 배차 · 최종리스트')
+        b1, b2, b3 = st.columns(3)
+        paste_final_id = b1.text_area(
+            'Delivery',
+            height=190,
+            placeholder='Delivery 열 붙여넣기',
+            key='simple_final_delivery'
+        )
+        paste_final_vehicle = b2.text_area(
+            'Vehicle Number(Full)',
+            height=190,
+            placeholder='최종 차량번호 열 붙여넣기',
+            key='simple_final_vehicle'
+        )
+        paste_final_status = b3.text_area(
+            'PDAStepStatus',
+            height=190,
+            placeholder='상태코드 열 붙여넣기\n빈값도 정상입니다.',
+            key='simple_final_status'
+        )
+        st.caption('판정기준 · L·7 = 연기 / 3·P = 취소 / 빈값과 그 외 코드는 일반상태')
+
+        final_ready = bool(paste_final_id.strip() and paste_final_vehicle.strip())
+        initial_ready = bool(paste_initial_id.strip() and paste_initial_vehicle.strip()) or base is not None
+
+        if st.button(
+            '분석하기',
+            type='primary',
+            use_container_width=True,
+            disabled=not (initial_ready and final_ready),
+            key='simple_analyze'
+        ):
+            try:
+                first_doc, last_doc = read_pasted_columns(
+                    paste_initial_id,
+                    paste_initial_vehicle,
+                    paste_final_id,
+                    paste_final_vehicle,
+                    paste_final_status,
+                    use_saved_initial=(
+                        base['initial']
+                        if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
+                        else None
+                    ),
+                    comparison_date=paste_day.isoformat()
+                )
+                st.session_state['delivery_preview'] = {
+                    'selected': selected,
+                    'comparison_date': paste_day.isoformat(),
+                    'initial': first_doc,
+                    'final': last_doc,
+                    'initial_name': (
+                        base['initial_name']
+                        if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip())
+                        else '상세정보 · 복사붙여넣기'
+                    ),
+                    'final_name': '최종리스트 · 복사붙여넣기'
+                }
+                st.session_state['simple_analyzed_notice'] = True
+                st.rerun()
+            except CompareError as exc:
+                st.error(str(exc))
+
+        if st.session_state.pop('simple_analyzed_notice', False):
+            st.success('분석 완료 · 「한눈에 보기」 탭에서 결과를 확인하세요.')
+
+        # 현재 미리보기가 있으면 저장 버튼만 단순하게 표시
+        preview = st.session_state.get('delivery_preview')
+        current = preview if preview and preview.get('selected') == selected else work
+        if current and repository:
+            st.divider()
+            st.markdown('### 3. 저장')
+            save_day_text = current.get('comparison_date', paste_day.isoformat())
+            try:
+                save_day_default = date.fromisoformat(save_day_text)
+            except Exception:
+                save_day_default = paste_day
+
+            save_day = st.date_input(
+                '저장할 배차일',
+                value=save_day_default,
+                key='simple_save_day'
+            )
+            confirmed = st.checkbox(
+                '분석 결과를 확인했고 이 배차일로 저장합니다.',
+                key='simple_save_confirm'
+            )
+            if st.button(
+                'Supabase에 저장',
+                type='primary',
+                use_container_width=True,
+                disabled=not confirmed,
+                key='simple_save'
+            ):
                 try:
-                    suggested = date.fromisoformat(next(iter(date_counts)))
-                except ValueError:
-                    suggested = datetime.now(ZoneInfo("Asia/Seoul")).date()
-            else:
-                suggested = datetime.now(ZoneInfo("Asia/Seoul")).date()
-            save_day = st.date_input('비교일(자료 분류용, 완료시각 아님)', value=date.fromisoformat(selected) if selected != '새 파일 비교' else suggested, key='pair_save_date')
-            if len(date_counts) != 1 or save_day.isoformat() not in date_counts:
-                st.warning('저장할 비교일과 원본 계획일을 확인하세요. 여러 날짜가 포함된 파일은 적절한 범위로 다시 내보내는 것이 좋습니다.')
-            confirmed = st.checkbox('비교일·조회 범위를 확인했습니다. 최초 원본을 고정하고 최종 파일을 새 버전으로 저장합니다.', key='pair_confirm')
-            if st.button('비교자료 저장', disabled=not confirmed, type='primary', key='pair_save'):
-                try:
-                    n = repository.save(save_day.isoformat(), work['initial'], work['final'], actor, work['initial_name'], work['final_name'])
-                    st.success(f'등록 완료 · 신규 데이터셋 {n}개. 같은 내용은 중복 저장하지 않았습니다.')
+                    n = repository.save(
+                        save_day.isoformat(),
+                        current['initial'],
+                        current['final'],
+                        actor,
+                        current['initial_name'],
+                        current['final_name']
+                    )
+                    st.success(f'저장 완료 · 신규 데이터셋 {n}개')
                 except CompareError as exc:
                     st.error(str(exc))
                 except Exception:
-                    st.error('저장에 실패했습니다. 파일 전체를 반영하지 않았습니다. 연결과 권한을 확인하세요.')
-            backup = json.dumps({'schema_version': 3, 'comparison_date': save_day.isoformat(), 'initial': work['initial'], 'final': work['final'], 'delay_codes': list(DELAY_CODES), 'cancel_codes': list(CANCEL_CODES)}, ensure_ascii=False, indent=2).encode('utf8')
-            st.download_button('현재 비교 원자료 JSON 백업', backup, file_name='납품번호비교_백업.json', mime='application/json')
-            st.caption('고객명·주소·전화번호를 제외한 비교용 필드만 저장합니다. 데이터베이스 전체 보존·복구는 관리자의 DB 백업으로 수행하세요. 예시/조회용 CSV만으로는 최초 데이터셋 복구가 되지 않습니다.')
-        elif mode == 'demo':
-            st.info('가상 예시 모드입니다. 실제 사용은 승인된 로그인·저장소 설정 또는 PC 로컬 모드에서 가능합니다.')
+                    st.error('저장에 실패했습니다. 데이터베이스 연결을 확인하세요.')
+
+        # CSV는 숨겨진 보조 기능으로만 유지
+        with st.expander('기타 · CSV 업로드 / 백업'):
+            st.caption('회사 환경에서 CSV가 정상적으로 읽히는 경우에만 사용하세요.')
+            c1, c2 = st.columns(2)
+            first_upload = c1.file_uploader(
+                '상세정보.csv',
+                type=['csv'],
+                key='simple_csv_initial'
+            )
+            last_upload = c2.file_uploader(
+                '최종리스트.csv',
+                type=['csv'],
+                key='simple_csv_final'
+            )
+            if st.button(
+                'CSV 분석',
+                disabled=last_upload is None or (first_upload is None and base is None),
+                key='simple_csv_analyze'
+            ):
+                try:
+                    first_doc = (
+                        read_csv_source(first_upload.getvalue(), 'initial', first_upload.name)
+                        if first_upload else base['initial']
+                    )
+                    last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
+                    st.session_state['delivery_preview'] = {
+                        'selected': selected,
+                        'comparison_date': selected if selected != NEW_LABEL else '',
+                        'initial': first_doc,
+                        'final': last_doc,
+                        'initial_name': first_upload.name if first_upload else base['initial_name'],
+                        'final_name': last_upload.name
+                    }
+                    st.rerun()
+                except CompareError as exc:
+                    st.error(str(exc))
+
+            if current:
+                backup_day = current.get('comparison_date', '')
+                backup = json.dumps({
+                    'schema_version': 3,
+                    'comparison_date': backup_day,
+                    'initial': current['initial'],
+                    'final': current['final'],
+                    'delay_codes': list(DELAY_CODES),
+                    'cancel_codes': list(CANCEL_CODES)
+                }, ensure_ascii=False, indent=2).encode('utf8')
+                st.download_button(
+                    '현재 비교자료 JSON 백업',
+                    backup,
+                    file_name='납품번호비교_백업.json',
+                    mime='application/json',
+                    key='simple_backup'
+                )
+
