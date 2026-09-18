@@ -450,9 +450,27 @@ def render(mode, can_edit, actor, store):
 
     /* 휴대폰 화면 */
     @media (max-width: 768px) {
+        /* Streamlit 모바일 상단 고정바(사이드바/Fork/GitHub 메뉴)가
+           본문을 덮지 않도록 충분한 상단 여백 확보 */
         .block-container {
             max-width: 100%;
-            padding: .65rem .65rem 2rem .65rem;
+            padding: 4.6rem .65rem 2rem .65rem !important;
+        }
+
+        /* 모바일 상단 고정바 높이를 일정하게 유지 */
+        [data-testid="stHeader"] {
+            height: 3.5rem !important;
+            min-height: 3.5rem !important;
+        }
+
+        /* 첫 번째 본문 요소가 헤더 밑으로 숨지 않도록 추가 안전 여백 */
+        [data-testid="stAppViewContainer"] > .main {
+            padding-top: 0 !important;
+        }
+
+        /* 사이드바가 열렸을 때 본문 위에 애매하게 걸치지 않도록 */
+        [data-testid="stSidebar"] {
+            z-index: 999999 !important;
         }
         .dispatch-head {
             padding: 13px 14px;
@@ -495,6 +513,13 @@ def render(mode, can_edit, actor, store):
         .stFormSubmitButton > button {
             min-height: 44px;
             font-weight: 800;
+        }
+
+        /* iPhone Safari의 안전영역까지 고려 */
+        @supports (padding: env(safe-area-inset-top)) {
+            .block-container {
+                padding-top: calc(4.6rem + env(safe-area-inset-top)) !important;
+            }
         }
         input {
             min-height: 44px;
