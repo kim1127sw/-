@@ -153,6 +153,81 @@ def read_csv_source(data: bytes, kind: str, filename: str = ''):
         raise CompareError('자료 행이 없습니다.')
     return {'kind': kind, 'sheet': filename or 'CSV', 'rows': output, 'encoding': enc}
 
+
+def _paste_lines(raw: str, header_names=()):
+    """Excel 한 열을 복사해 붙인 텍스트를 행 단위로 유지합니다."""
+    raw = (raw or '').replace('\r\n', '\n').replace('\r', '\n')
+    lines = raw.split('\n')
+    # 브라우저 textarea가 마지막 줄바꿈을 포함하는 경우 끝의 빈 줄만 제거
+    while lines and lines[-1] == '':
+        lines.pop()
+    if lines and text(lines[0]).lower() in {text(x).lower() for x in header_names}:
+        lines = lines[1:]
+    return [text(x) for x in lines]
+
+def read_pasted_columns(initial_delivery: str, initial_vehicle: str,
+                        final_delivery: str, final_vehicle: str, final_status: str,
+                        use_saved_initial=None):
+    """파일을 올리지 않고 Excel 열 복사/붙여넣기만으로 비교용 자료를 만듭니다."""
+    if use_saved_initial is None:
+        a_id = _paste_lines(initial_delivery, ('납품번호', 'Delivery'))
+        a_vehicle = _paste_lines(initial_vehicle, ('배차차량', '차량번호', '배차 차량', '차량 번호'))
+        if not a_id or not a_vehicle:
+            raise CompareError('상세정보의 납품번호와 배차차량을 각각 붙여넣어 주세요.')
+        if len(a_id) != len(a_vehicle):
+            raise CompareError(f'상세정보 행 수가 다릅니다. 납품번호 {len(a_id):,}행 / 배차차량 {len(a_vehicle):,}행. 같은 범위를 복사해 주세요.')
+        initial_rows = []
+        for i, (ident, truck) in enumerate(zip(a_id, a_vehicle), start=1):
+            if not ident and not truck:
+                continue
+            if not ident:
+                raise CompareError(f'상세정보 붙여넣기 {i}행의 납품번호가 비어 있습니다.')
+            if ident.endswith('.0') and ident[:-2].isdigit():
+                ident = ident[:-2]
+            if not re.fullmatch(r'\d+', ident):
+                raise CompareError(f'상세정보 붙여넣기 {i}행 납품번호가 숫자가 아닙니다: {ident[:30]}')
+            initial_rows.append({
+                'id': ident, 'row': i, 'vehicle': vehicle(truck), 'zone': '',
+                'qty': None, 'volume': None, 'model': '', 'route': ''
+            })
+        if not initial_rows:
+            raise CompareError('상세정보 붙여넣기 자료가 없습니다.')
+        initial = {'kind': 'initial', 'sheet': '상세정보 · 복사붙여넣기', 'rows': initial_rows, 'encoding': 'clipboard'}
+    else:
+        initial = use_saved_initial
+
+    b_id = _paste_lines(final_delivery, ('Delivery', '납품번호'))
+    b_vehicle = _paste_lines(final_vehicle, ('Vehicle Number(Full)', 'VehicleNumber(Full)', 'Vehicle Number'))
+    b_status = _paste_lines(final_status, ('PDAStepStatus', 'PDA Step Status'))
+    if not b_id or not b_vehicle or not b_status:
+        raise CompareError('최종리스트의 Delivery, Vehicle Number(Full), PDAStepStatus를 각각 붙여넣어 주세요.')
+    if len({len(b_id), len(b_vehicle), len(b_status)}) != 1:
+        raise CompareError(
+            f'최종리스트 행 수가 다릅니다. Delivery {len(b_id):,}행 / '
+            f'차량 {len(b_vehicle):,}행 / PDAStepStatus {len(b_status):,}행. 같은 범위를 복사해 주세요.'
+        )
+    final_rows = []
+    for i, (ident, truck, status) in enumerate(zip(b_id, b_vehicle, b_status), start=1):
+        if not ident and not truck and not status:
+            continue
+        if not ident:
+            raise CompareError(f'최종리스트 붙여넣기 {i}행의 Delivery가 비어 있습니다.')
+        if ident.endswith('.0') and ident[:-2].isdigit():
+            ident = ident[:-2]
+        if not re.fullmatch(r'\d+', ident):
+            raise CompareError(f'최종리스트 붙여넣기 {i}행 Delivery가 숫자가 아닙니다: {ident[:30]}')
+        final_rows.append({
+            'id': ident, 'row': i, 'vehicle': vehicle(truck),
+            'item': '', 'qty': None, 'volume': None, 'volume_unit': '',
+            'model': '', 'code': text(status).upper(), 'description': '',
+            'route': '', 'op_date': '', 'book_date': '', 'assign_date': ''
+        })
+    if not final_rows:
+        raise CompareError('최종리스트 붙여넣기 자료가 없습니다.')
+    final = {'kind': 'final', 'sheet': '최종리스트 · 복사붙여넣기', 'rows': final_rows, 'encoding': 'clipboard'}
+    return initial, final
+
+
 def build_comparison_local(initial, final):
     """기존 delivery_compare.py 버전과 무관하게 현재 업무 기준으로 판정합니다."""
     delays = set(DELAY_CODES)
@@ -291,29 +366,101 @@ def render(mode, can_edit, actor, store):
         preview = st.session_state.get('delivery_preview')
         if preview and preview.get('selected') == selected:
             work = preview
-        with st.expander('① CSV 파일 등록 · 상세정보.csv + 최종리스트.csv', expanded=work is None):
-            st.info('Excel에서 CSV 또는 CSV UTF-8로 저장한 두 파일을 올리세요. UTF-8·CP949·EUC-KR·UTF-16을 자동 인식합니다. 필요한 납품번호·차량·품목·상태 열만 읽고 고객명·주소·전화번호는 저장하지 않습니다.')
+        with st.expander('① Excel에서 필요한 열만 복사 · 붙여넣기 (권장)', expanded=work is None):
+            st.info(
+                '파일 업로드나 CSV 저장 없이 사용합니다. Excel 원본은 회사 PC에서 그대로 열고, '
+                '아래 필요한 열의 데이터만 복사(Ctrl+C)해서 붙여넣으세요(Ctrl+V). '
+                '고객명·주소·전화번호는 붙여넣지 않습니다.'
+            )
+            st.warning(
+                '주의: 붙여넣은 납품번호·차량번호·상태코드는 Streamlit 서버로 전송됩니다. '
+                '회사 정책이 외부 전송 자체를 금지한다면 이 방법도 사용하지 말고 IT 담당자에게 확인하세요.'
+            )
             if not can_edit:
-                st.caption('조회 전용 계정입니다. 편집 권한이 있는 담당자가 파일을 등록해야 합니다.')
+                st.caption('조회 전용 계정입니다. 편집 권한이 있는 담당자가 자료를 등록해야 합니다.')
             else:
-                st.caption('업로드한 파일은 앱 운영 서버로 전송됩니다. 회사에서 승인한 환경에서만 사용하세요.')
-                c1, c2 = st.columns(2)
-                first_upload = c1.file_uploader('최초배차 · 상세정보.csv', type=['csv'], key='pair_first_upload')
-                last_upload = c2.file_uploader('최종배차 · 최종리스트.csv', type=['csv'], key='pair_final_upload')
+                st.markdown('**A. 상세정보(최초배차)** · Excel에서 같은 행 범위를 각각 복사합니다.')
+                a1, a2 = st.columns(2)
+                paste_initial_id = a1.text_area(
+                    '납품번호 열 붙여넣기',
+                    height=170,
+                    placeholder='예)\n7366379419\n7366379420\n7366379421',
+                    key='paste_initial_delivery'
+                )
+                paste_initial_vehicle = a2.text_area(
+                    '배차차량 열 붙여넣기',
+                    height=170,
+                    placeholder='예)\n경북80아9992\n경북86아6723\n경북80아9912',
+                    key='paste_initial_vehicle'
+                )
                 if base:
-                    st.caption('최초 파일을 생략하면 선택한 비교일에 고정된 상세정보를 사용합니다.')
-                if st.button('두 파일 분석하기', type='primary', disabled=last_upload is None or (first_upload is None and base is None), key='pair_analyze'):
+                    st.caption('왼쪽에서 저장된 비교일을 선택한 경우, 위 상세정보 두 칸을 비워두면 저장된 최초배차를 그대로 사용합니다.')
+
+                st.markdown('**B. 최종리스트(변경 후 최종)** · 세 열 모두 같은 행 범위를 복사합니다.')
+                b1, b2, b3 = st.columns(3)
+                paste_final_id = b1.text_area(
+                    'Delivery 열 붙여넣기',
+                    height=190,
+                    placeholder='예)\n7366379419\n7366379420',
+                    key='paste_final_delivery'
+                )
+                paste_final_vehicle = b2.text_area(
+                    'Vehicle Number(Full) 열 붙여넣기',
+                    height=190,
+                    placeholder='예)\n경북80아9938\n경북86아6723',
+                    key='paste_final_vehicle'
+                )
+                paste_final_status = b3.text_area(
+                    'PDAStepStatus 열 붙여넣기',
+                    height=190,
+                    placeholder='예)\nL\n3',
+                    key='paste_final_status'
+                )
+                st.caption('열 제목까지 같이 복사해도 자동으로 제외합니다. 빈 행이 섞이지 않도록 같은 시작행·끝행을 선택하세요.')
+                final_ready = bool(paste_final_id.strip() and paste_final_vehicle.strip() and paste_final_status.strip())
+                initial_ready = bool(paste_initial_id.strip() and paste_initial_vehicle.strip()) or base is not None
+                if st.button('붙여넣은 자료 분석하기', type='primary',
+                             disabled=not (initial_ready and final_ready), key='pair_analyze_paste'):
                     try:
-                        first_doc = read_csv_source(first_upload.getvalue(), 'initial', first_upload.name) if first_upload else base['initial']
-                        last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
-                        work = {'selected': selected, 'initial': first_doc, 'final': last_doc,
-                            'initial_name': first_upload.name if first_upload else base['initial_name'], 'final_name': last_upload.name}
+                        first_doc, last_doc = read_pasted_columns(
+                            paste_initial_id, paste_initial_vehicle,
+                            paste_final_id, paste_final_vehicle, paste_final_status,
+                            use_saved_initial=(base['initial'] if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip()) else None)
+                        )
+                        work = {
+                            'selected': selected,
+                            'initial': first_doc,
+                            'final': last_doc,
+                            'initial_name': (base['initial_name'] if base is not None and not (paste_initial_id.strip() or paste_initial_vehicle.strip()) else '상세정보 · 복사붙여넣기'),
+                            'final_name': '최종리스트 · 복사붙여넣기'
+                        }
                         st.session_state['delivery_preview'] = work
                         st.success('분석했습니다. 아직 저장소에 등록하지 않은 미리보기입니다.')
                     except CompareError as exc:
                         st.error(str(exc))
+
+        with st.expander('CSV 파일 업로드 · 가능한 경우에만 사용', expanded=False):
+            st.caption('회사 환경에서 CSV 업로드가 정상 동작할 때만 사용하는 보조 방식입니다.')
+            if can_edit:
+                c1, c2 = st.columns(2)
+                first_upload = c1.file_uploader('최초배차 · 상세정보.csv', type=['csv'], key='pair_first_upload')
+                last_upload = c2.file_uploader('최종배차 · 최종리스트.csv', type=['csv'], key='pair_final_upload')
+                if st.button('CSV 두 파일 분석하기', disabled=last_upload is None or (first_upload is None and base is None), key='pair_analyze_csv'):
+                    try:
+                        first_doc = read_csv_source(first_upload.getvalue(), 'initial', first_upload.name) if first_upload else base['initial']
+                        last_doc = read_csv_source(last_upload.getvalue(), 'final', last_upload.name)
+                        work = {
+                            'selected': selected, 'initial': first_doc, 'final': last_doc,
+                            'initial_name': first_upload.name if first_upload else base['initial_name'],
+                            'final_name': last_upload.name
+                        }
+                        st.session_state['delivery_preview'] = work
+                        st.success('분석했습니다. 아직 저장소에 등록하지 않은 미리보기입니다.')
+                    except CompareError as exc:
+                        st.error(str(exc))
+
         if work is None:
-            st.info('상세정보.csv와 최종리스트.csv를 올린 뒤 「두 파일 분석하기」를 누르세요. 저장된 자료는 왼쪽에서 선택할 수 있습니다.')
+            st.info('Excel에서 필요한 열을 복사해 위 입력칸에 붙여넣고 「붙여넣은 자료 분석하기」를 누르세요. 저장된 자료는 왼쪽에서 선택할 수 있습니다.')
             return
     st.sidebar.caption('상태 기준: L·7 = 연기 / 3·P = 취소')
     result = build_comparison_local(work['initial'], work['final'])
@@ -379,7 +526,7 @@ def render(mode, can_edit, actor, store):
             c3.metric('상태', detail['처리구분'])
             st.write('차량 이동: ' + detail['차량 이동'] + ' / PDAStepStatus: ' + (detail['PDAStepStatus'] or '없음'))
             st.caption('원문 상태: ' + (detail['PDAStatusTxt(원문)'] or '없음'))
-            st.caption('근거 행(헤더 포함 CSV 행번호) · 상세정보: ' + (detail['최초 근거행'] or '없음') + ' / 최종리스트: ' + (detail['최종 근거행'] or '없음'))
+            st.caption('근거 행(붙여넣기 또는 CSV 행번호) · 상세정보: ' + (detail['최초 근거행'] or '없음') + ' / 최종리스트: ' + (detail['최종 근거행'] or '없음'))
             with st.expander('해당 납품번호 품목별 최종 원본값'):
                 item_rows = [{'Delivery': r['id'], 'item': r.get('item'), '최종 차량': r['vehicle'], 'Material': r.get('model'), 'Qty(첫 번째 열)': r.get('qty'), 'PDAStepStatus': r.get('code'), 'PDAStatusTxt': r.get('description'), 'CSV행': r['row']} for r in work['final']['rows'] if r['id'] == delivery]
                 show_table(item_rows, '선택납품_최종품목', 220)
