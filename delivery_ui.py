@@ -277,11 +277,18 @@ def build_comparison_local(initial, final):
             '확인사항': ' / '.join(sorted(set(issues))),
         })
     matched = sum(r['매칭구분'] == '양쪽 일치' for r in rows)
+    delay_count = sum(r['처리구분'] == '연기' for r in rows)
+    cancel_count = sum(r['처리구분'] == '취소' for r in rows)
+    final_listed_count = len(b)
+    final_dispatch_count = max(0, final_listed_count - delay_count - cancel_count)
     metrics = {
-        '최초 납품번호': len(a), '최종 Delivery': len(b), '양쪽 일치': matched,
+        '최초 배차건수': len(a),
+        '최종 배차건수': final_dispatch_count,
+        '최종 원본등재건수(참고)': final_listed_count,
+        '양쪽 일치': matched,
         '차량 변경': sum(r['차량 이동'] == '배차변경' for r in rows),
-        '연기': sum(r['처리구분'] == '연기' for r in rows),
-        '취소': sum(r['처리구분'] == '취소' for r in rows),
+        '연기': delay_count,
+        '취소': cancel_count,
         '상태 혼합 확인': sum(r['처리구분'] == '상태 혼합 확인' for r in rows),
         '최종미존재': len(a) - matched, '최종만 존재': len(b) - matched,
         '확인필요': sum(bool(r['확인사항']) for r in rows),
@@ -303,7 +310,9 @@ def transfer_summary_local(rows):
             for (a, b), c in sorted(groups.items(), key=lambda x: (-x[1]['납품건수'], x[0]))]
 
 def vehicle_summary_local(rows):
-    names = sorted({v for r in rows for key in ('최초 차량번호', '최종 차량번호') for v in r[key].split(' / ') if v})
+    """차량별 최초 배차건수와 연기·취소를 제외한 최종 배차건수를 비교합니다."""
+    names = sorted({v for r in rows for key in ('최초 차량번호', '최종 차량번호')
+                    for v in r[key].split(' / ') if v})
     result = []
     for v in names:
         first = [r for r in rows if v in r['최초 차량번호'].split(' / ')]
@@ -314,17 +323,35 @@ def vehicle_summary_local(rows):
         inc = sum(r['차량 이동'] == '배차변경' for r in last)
         missing = sum(r['매칭구분'] == '최종미존재' for r in first)
         extra = sum(r['매칭구분'] == '최종만 존재' for r in last)
-        expected = len(first) - missing - out + inc + extra
+
+        delay_last = sum(r['처리구분'] == '연기' for r in last)
+        cancel_last = sum(r['처리구분'] == '취소' for r in last)
+        final_listed = len(last)
+        final_dispatch = max(0, final_listed - delay_last - cancel_last)
+
+        # 이 검산은 원본 최종 등재건수 기준입니다. 연기·취소 제외 최종 배차건수와는 별도입니다.
+        expected_listed = len(first) - missing - out + inc + extra
+
         result.append({
-            '차량번호': v, '최초 납품건수': len(first), '최종 등재건수': len(last),
-            '등재 증감': len(last) - len(first), '동일대상 최초건수': len(paired_first), '동일대상 최종건수': len(paired_last),
-            '반출': out, '반입': inc,
+            '차량번호': v,
+            '최초 배차건수': len(first),
+            '최종 배차건수': final_dispatch,
+            '배차 증감': final_dispatch - len(first),
+            '최종 원본등재(참고)': final_listed,
+            '연기 제외': delay_last,
+            '취소 제외': cancel_last,
+            '동일대상 최초건수': len(paired_first),
+            '동일대상 최종등재건수': len(paired_last),
+            '반출': out,
+            '반입': inc,
             '최초차량 기준 연기': sum(r['처리구분'] == '연기' for r in first),
-            '최종차량 기준 연기': sum(r['처리구분'] == '연기' for r in last),
+            '최종차량 기준 연기': delay_last,
             '최초차량 기준 취소': sum(r['처리구분'] == '취소' for r in first),
-            '최종차량 기준 취소': sum(r['처리구분'] == '취소' for r in last),
+            '최종차량 기준 취소': cancel_last,
             '최종차량 상태혼합': sum(r['처리구분'] == '상태 혼합 확인' for r in last),
-            '최종미존재': missing, '최종만 존재': extra, '등재건수 검산차이': len(last) - expected,
+            '최종미존재': missing,
+            '최종만 존재': extra,
+            '원본등재 검산차이': final_listed - expected_listed,
             '일반상태 최종건수': sum(r['처리구분'] == '일반상태' for r in last),
         })
     return result
@@ -339,7 +366,7 @@ def show_table(rows, key, height=420):
 
 def render(mode, can_edit, actor, store):
     st.subheader('상세정보 → 최종리스트 · 납품번호별 차량 이동')
-    st.caption('최초: 상세정보.csv의 납품번호·차량번호 / 최종: 최종리스트.csv의 Delivery·Vehicle Number(Full)')
+    st.caption('최초: 상세정보의 납품번호·배차차량 / 최종: 최종리스트의 Delivery·Vehicle Number(Full) · 복사/붙여넣기 지원')
     repository = None
     base = None
     selected = '새 파일 비교'
@@ -480,10 +507,18 @@ def render(mode, can_edit, actor, store):
     direction = st.sidebar.radio('차량 조회 기준', ['최초 또는 최종', '최초 차량', '최종 차량'], key='pair_truck_direction')
     zones = sorted({r['최초 ZONE'] for r in all_rows if r['최초 ZONE']})
     zone = st.sidebar.selectbox('최초 ZONE', ['전체'] + zones, key='pair_zone')
-    mapping = st.sidebar.multiselect('매칭구분', ['양쪽 일치', '최종미존재', '최종만 존재'], default=['양쪽 일치', '최종미존재', '최종만 존재'], key='pair_matching')
-    only_move = st.sidebar.checkbox('차량 변경만', key='pair_only_move')
-    only_delay = st.sidebar.checkbox('연기만', key='pair_only_delay')
-    only_cancel = st.sidebar.checkbox('취소만', key='pair_only_cancel')
+    mapping = st.sidebar.multiselect(
+        '매칭구분',
+        ['양쪽 일치', '최종미존재', '최종만 존재'],
+        default=['양쪽 일치', '최종미존재', '최종만 존재'],
+        key='pair_matching'
+    )
+    quick_view = st.sidebar.radio(
+        '빠른 조회',
+        ['전체', '차량변경만', '연기만', '취소만'],
+        horizontal=False,
+        key='pair_quick_view'
+    )
     rows = []
     for r in all_rows:
         if query and query not in r['납품번호 / Delivery']:
@@ -493,24 +528,37 @@ def render(mode, can_edit, actor, store):
         truck_keys = ['최초 차량번호', '최종 차량번호'] if direction == '최초 또는 최종' else ['최초 차량번호' if direction == '최초 차량' else '최종 차량번호']
         if truck != '전체' and not any(truck in r[k].split(' / ') for k in truck_keys):
             continue
-        if only_move and r['차량 이동'] != '배차변경':
+        if quick_view == '차량변경만' and r['차량 이동'] != '배차변경':
             continue
-        if only_delay and not only_cancel and r['처리구분'] != '연기':
+        if quick_view == '연기만' and r['처리구분'] != '연기':
             continue
-        if only_cancel and not only_delay and r['처리구분'] != '취소':
-            continue
-        if only_delay and only_cancel and r['처리구분'] not in ('연기', '취소'):
+        if quick_view == '취소만' and r['처리구분'] != '취소':
             continue
         rows.append(r)
     st.sidebar.caption('모든 표·지표는 위 검색과 필터 결과에 함께 적용됩니다. 셀 소속은 추정하지 않고 원본 ZONE만 표시합니다.')
     initial_count = sum(r['매칭구분'] != '최종만 존재' for r in rows)
-    final_count = sum(r['매칭구분'] != '최종미존재' for r in rows)
-    stats = [('최초 납품건', initial_count), ('최종 등재건', final_count), ('차량 변경', sum(r['차량 이동'] == '배차변경' for r in rows)),
-             ('연기', sum(r['처리구분'] == '연기' for r in rows)), ('취소', sum(r['처리구분'] == '취소' for r in rows)),
-             ('최종미존재', sum(r['매칭구분'] == '최종미존재' for r in rows)), ('최종만 존재', sum(r['매칭구분'] == '최종만 존재' for r in rows))]
+    final_listed_count = sum(r['매칭구분'] != '최종미존재' for r in rows)
+    delay_count = sum(r['처리구분'] == '연기' for r in rows)
+    cancel_count = sum(r['처리구분'] == '취소' for r in rows)
+    # 사용자 업무기준: 최종 배차건수 = 최종 등재건수 - 연기 - 취소
+    final_dispatch_count = max(0, final_listed_count - delay_count - cancel_count)
+    stats = [
+        ('최초 배차건수', initial_count),
+        ('최종 배차건수', final_dispatch_count),
+        ('차량 변경', sum(r['차량 이동'] == '배차변경' for r in rows)),
+        ('연기', delay_count),
+        ('취소', cancel_count),
+        ('최종미존재', sum(r['매칭구분'] == '최종미존재' for r in rows)),
+        ('최종만 존재', sum(r['매칭구분'] == '최종만 존재' for r in rows)),
+    ]
     for col, (label, value) in zip(st.columns(7), stats):
         col.metric(label, f'{value:,} 건')
-    st.caption(f'현재 필터: 고유 납품번호 {len(rows):,}건 · 양쪽 일치 {sum(r["매칭구분"] == "양쪽 일치" for r in rows):,}건 · 상태 혼합 확인 {sum(r["처리구분"] == "상태 혼합 확인" for r in rows):,}건.')
+    st.caption(
+        f'현재 필터: 고유 납품번호 {len(rows):,}건 · '
+        f'최종 원본등재 {final_listed_count:,}건 - 연기 {delay_count:,}건 - 취소 {cancel_count:,}건 '
+        f'= 최종 배차건수 {final_dispatch_count:,}건 · '
+        f'상태 혼합 확인 {sum(r["처리구분"] == "상태 혼합 확인" for r in rows):,}건.'
+    )
     if result['metrics']['최종미존재'] or result['metrics']['최종만 존재']:
         st.warning('한쪽 파일에만 존재하는 건은 별도 표시합니다. 최종에 없다는 이유만으로 취소·연기로 분류하지 않습니다. 두 파일의 조회 대상·기간을 확인하세요.')
     t1, t2, t3, t4, t5 = st.tabs(['납품번호 조회', '차량 이동·반출입', '연기·취소 현황', '차량별 비교', '등록·검증 기준'])
@@ -554,17 +602,17 @@ def render(mode, can_edit, actor, store):
             show_table(mixed_rows, '상태혼합_확인필요', 220)
         st.caption('고정 판정 규칙: L·7은 연기, 3·P는 취소입니다. 그 외 코드는 일반상태로 두며 임의로 완료라고 단정하지 않습니다.')
     with t4:
-        st.subheader('차량별 최초·최종 등재건수와 반출입')
+        st.subheader('차량별 최초·최종 배차건수와 반출입')
         vehicle_rows = vehicle_summary_local(rows)
-        chart_rows = sorted(vehicle_rows, key=lambda x: abs(x['등재 증감']), reverse=True)[:20]
+        chart_rows = sorted(vehicle_rows, key=lambda x: abs(x['배차 증감']), reverse=True)[:20]
         if chart_rows:
-            points = [{'차량번호': r['차량번호'], '시점': stage, '납품건수': r[key]} for r in chart_rows for stage, key in [('최초', '최초 납품건수'), ('최종', '최종 등재건수')]]
+            points = [{'차량번호': r['차량번호'], '시점': stage, '배차건수': r[key]} for r in chart_rows for stage, key in [('최초', '최초 배차건수'), ('최종', '최종 배차건수')]]
             st.vega_lite_chart(spec={'data': {'values': points}, 'mark': 'bar', 'encoding': {
                 'x': {'field': '차량번호', 'type': 'nominal', 'axis': {'labelAngle': -45}},
-                'xOffset': {'field': '시점'}, 'y': {'field': '납품건수', 'type': 'quantitative'},
-                'color': {'field': '시점', 'type': 'nominal'}, 'tooltip': [{'field': '차량번호'}, {'field': '시점'}, {'field': '납품건수'}]}}, use_container_width=True)
+                'xOffset': {'field': '시점'}, 'y': {'field': '배차건수', 'type': 'quantitative'},
+                'color': {'field': '시점', 'type': 'nominal'}, 'tooltip': [{'field': '차량번호'}, {'field': '시점'}, {'field': '배차건수'}]}}, use_container_width=True)
         show_table(vehicle_rows, '차량별_최초최종비교')
-        st.caption('등재건수 검산은 원본 등재 여부와 차량 이동을 기준으로 합니다. 연기·취소는 PDAStepStatus 판정값으로 별도 집계합니다.')
+        st.caption('최종 배차건수는 최종 원본등재건수에서 연기(L·7)와 취소(3·P)를 제외해 계산합니다. 원본등재 검산은 참고용입니다.')
         st.caption('복수 차량으로 분할된 Delivery는 각 차량에 1건씩 포함되므로 차량 합계가 고유 Delivery 합계보다 클 수 있습니다. 해당 건은 확인사항에 표시합니다.')
     with t5:
         st.subheader('원본·중복·상태 검증')
@@ -576,7 +624,7 @@ def render(mode, can_edit, actor, store):
 - 납품번호 = Delivery. 숫자형·문자형 차이와 공백을 정리하되 문자 식별자의 앞자리 0은 임의 삭제하지 않습니다.
 - 최종 차량은 Vehicle Number(Full). 번호 뒷자리만으로 차량을 연결하지 않습니다.
 - Delivery 여러 품목행은 납품 1건. 품목별 상태가 섞이면 상태 혼합 확인으로 표시합니다.
-- **L·7 = 연기 / 3·P = 취소**로 판정합니다. 원문 상태 설명은 그대로 유지합니다.
+- **L·7 = 연기 / 3·P = 취소**로 판정합니다. 원문 상태 설명은 그대로 유지합니다.\n- **최종 배차건수 = 최종 원본등재건수 - 연기건수 - 취소건수**로 계산합니다.
 - 차량 변경과 처리상태는 독립 분류입니다. 누락·추가는 조회 범위 차이일 수 있습니다.
 - 최초 파일은 사용자 지정 기준본이며 정확한 최초 완료시각은 미제공입니다. 파일 등록시각을 완료시각으로 대체하지 않습니다.
 - 최종의 Qty 헤더가 두 번 나오면 품목 수량인 첫 번째 Qty 열만 사용합니다.
